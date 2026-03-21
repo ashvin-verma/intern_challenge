@@ -1,0 +1,21 @@
+[project]
+name = "intern-challenge"
+version = "0.1.0"
+description = "Partcl intern challenge - placement optimizer"
+requires-python = ">=3.12"
+dependencies = [
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "matplotlib",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
