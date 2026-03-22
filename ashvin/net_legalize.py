@@ -161,10 +161,25 @@ def net_aware_legalize(cell_features, pin_features, edge_list, num_macros=None,
             orig_x = positions[idx, 0].item()
 
             # Generate candidate slots:
-            # 1. Original position (if legal)
-            # 2. Positions in gaps between obstacles/placed cells
-            # 3. Positions at edges of occupied regions
+            # 1. Original position
+            # 2. Barycentric center of connected cells (best WL position)
+            # 3. Gaps between obstacles/placed cells
             candidates = [orig_x]
+
+            # Barycentric target — where WL wants this cell to be
+            nbrs = []
+            for e_idx in cell_edges.get(idx, []):
+                sp = edge_list[e_idx, 0].item()
+                tp = edge_list[e_idx, 1].item()
+                sc, tc = pin_to_cell[sp], pin_to_cell[tp]
+                other = tc if sc == idx else sc
+                nbrs.append(other)
+            if nbrs:
+                bary_x = sum(positions[n, 0].item() for n in nbrs) / len(nbrs)
+                candidates.append(bary_x)
+                # Also try positions slightly left/right of barycentric
+                candidates.append(bary_x - w)
+                candidates.append(bary_x + w)
 
             # Add gap positions
             all_occupied = sorted(occupied + placed_ranges, key=lambda r: r[0])

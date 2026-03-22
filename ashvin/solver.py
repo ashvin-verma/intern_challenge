@@ -149,8 +149,30 @@ def solve(
     cell_features[:, 2:4] = pos.detach()
 
     # === MULTI-PASS PIPELINE (compiler-style) ===
-    from ashvin.legalize import legalize
+    from ashvin.net_legalize import net_aware_legalize
+    from ashvin.legalize import legalize as legalize_fallback
     from ashvin.wl_optimize import barycentric_refinement, targeted_scatter_reconverge
+
+    def legalize_best(cf, pf=None, el=None):
+        """Row-pack first (reliable), then net-aware refinement (WL improvement)."""
+        pf = pf or pin_features
+        el = el or edge_list
+        # Step 1: reliable row-packing to guarantee zero overlap
+        stats = legalize_fallback(cf, pin_features=pf, edge_list=el)
+        # Step 2: net-aware refinement — try to improve WL by reassigning slots
+        from placement import calculate_normalized_metrics
+        wl_before = calculate_normalized_metrics(cf, pf, el)["normalized_wl"]
+        cf_backup = cf.clone()
+        try:
+            net_aware_legalize(cf, pf, el, alpha=0.1, beta=5.0)
+            repair_overlaps(cf, max_iterations=100)
+            wl_after = calculate_normalized_metrics(cf, pf, el)["normalized_wl"]
+            overlap_after = calculate_normalized_metrics(cf, pf, el)["overlap_ratio"]
+            if overlap_after > 0 or wl_after >= wl_before:
+                cf[:] = cf_backup  # revert if worse or has overlap
+        except Exception:
+            cf[:] = cf_backup
+        return stats
 
     skip_scatter = config.get("_skip_scatter", False) if config else False
     max_scatters = config.get("max_scatters", 3) if config else 3
@@ -163,7 +185,7 @@ def solve(
 
     # Phase 1: Initial legalization (guarantee zero overlap)
     for leg_pass in range(5):
-        leg_stats = legalize(cell_features, pin_features=pin_features, edge_list=edge_list)
+        leg_stats = legalize_best(cell_features)
         legalize_time += leg_stats["time"]
         rep_stats = repair_overlaps(cell_features, max_iterations=repair_iterations)
         repair_time += rep_stats["time"]
@@ -211,7 +233,7 @@ def solve(
 
         # Pass D: Re-legalize
         for _lp in range(3):
-            legalize(cell_features, pin_features=pin_features, edge_list=edge_list)
+            legalize_best(cell_features)
             rep = repair_overlaps(cell_features, max_iterations=100)
             if rep["overlaps_after"] == 0:
                 break
