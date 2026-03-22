@@ -251,6 +251,20 @@ def solve(
 
     cell_features[:] = best_features
 
+    # Phase 3: Detailed placement (swaps + reinsertion)
+    skip_detailed = config.get("_skip_detailed", False) if config else False
+    if not skip_detailed and N <= 300:
+        from ashvin.detailed import detailed_placement
+        from placement import calculate_normalized_metrics
+        wl_pre_dp = calculate_normalized_metrics(cell_features, pin_features, edge_list)["normalized_wl"]
+        cf_backup = cell_features.clone()
+        dp_stats = detailed_placement(cell_features, pin_features, edge_list)
+        # Verify legality + improvement
+        rep_final = repair_overlaps(cell_features, max_iterations=50)
+        m_post = calculate_normalized_metrics(cell_features, pin_features, edge_list)
+        if m_post["overlap_ratio"] > 0 or m_post["normalized_wl"] >= wl_pre_dp:
+            cell_features[:] = cf_backup  # revert if worse
+
     train_end = time.perf_counter()
 
     return {

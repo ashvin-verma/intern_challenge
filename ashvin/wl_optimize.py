@@ -362,6 +362,7 @@ def targeted_scatter_reconverge(cell_features, pin_features, edge_list, config=N
     scatter_config = dict(config) if config else {}
     scatter_config["epochs"] = 200
     scatter_config["_skip_scatter"] = True  # prevent recursion
+    scatter_config["_skip_detailed"] = True  # skip slow detailed placement in sub-solve
     _pair_cache["pairs"] = None
     _pair_cache["call_count"] = 0
 
