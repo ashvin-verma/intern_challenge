@@ -30,6 +30,7 @@ def solve(
     beta_start=0.1,
     beta_end=6.0,
     warmup_epochs=100,
+    lr_schedule="warmup",  # "warmup" (warmup only), "warmup_cosine", "constant"
     repair_iterations=200,
     config=None,
     verbose=False,
@@ -45,6 +46,7 @@ def solve(
         lambda_wl = config.get("lambda_wl", lambda_wl)
         lambda_overlap_start = config.get("lambda_overlap_start", lambda_overlap_start)
         lambda_overlap_end = config.get("lambda_overlap_end", lambda_overlap_end)
+        lr_schedule = config.get("lr_schedule", lr_schedule)
         lambda_density = config.get("lambda_density", lambda_density)
         beta_start = config.get("beta_start", beta_start)
         beta_end = config.get("beta_end", beta_end)
@@ -69,9 +71,20 @@ def solve(
     pos.requires_grad_(True)
 
     optimizer = optim.Adam([pos], lr=lr)
-    warmup = optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.1, total_iters=max(warmup_epochs, 1)
-    )
+
+    # LR schedule
+    schedulers = []
+    if lr_schedule in ("warmup", "warmup_cosine"):
+        schedulers.append(optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.1, total_iters=max(warmup_epochs, 1)
+        ))
+    if lr_schedule == "warmup_cosine":
+        schedulers.append(optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(epochs - warmup_epochs, 1)
+        ))
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers, milestones=[warmup_epochs]
+    ) if len(schedulers) == 2 else (schedulers[0] if schedulers else None)
 
     _pair_cache["pairs"] = None
     _pair_cache["call_count"] = 0
@@ -107,8 +120,8 @@ def solve(
         t4 = time.perf_counter()
 
         optimizer.step()
-        if epoch < warmup_epochs:
-            warmup.step()
+        if scheduler is not None:
+            scheduler.step()
         t5 = time.perf_counter()
 
         wl_time += t1 - t0
@@ -148,10 +161,12 @@ def solve(
         if repair_after == 0:
             break
 
-    # WL optimization: gradient polish → cell swaps
-    from ashvin.wl_optimize import gradient_wl_polish, cell_swap_optimization
-    wl_stats = gradient_wl_polish(cell_features, pin_features, edge_list)
-    swap_stats = cell_swap_optimization(cell_features, pin_features, edge_list)
+    # WL optimization: gradient polish → cell swaps (skip during tuning)
+    skip_wl = config.get("_skip_wl_polish", False) if config else False
+    if not skip_wl:
+        from ashvin.wl_optimize import gradient_wl_polish, cell_swap_optimization
+        wl_stats = gradient_wl_polish(cell_features, pin_features, edge_list)
+        swap_stats = cell_swap_optimization(cell_features, pin_features, edge_list)
 
     train_end = time.perf_counter()
 

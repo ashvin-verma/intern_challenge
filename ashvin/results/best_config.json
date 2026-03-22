@@ -1,0 +1,13 @@
+{
+  "epochs": 500,
+  "lr": 0.0030213111945481385,
+  "lambda_wl": 1.1626761185005827,
+  "lambda_overlap_start": 13.034375441664457,
+  "lambda_overlap_end": 139.39650608955264,
+  "lambda_density": 1.5937129799807837,
+  "beta_start": 0.7131918080051314,
+  "beta_end": 2.0929676930204244,
+  "warmup_epochs": 60,
+  "lr_schedule": "warmup",
+  "repair_iterations": 200
+}

@@ -211,7 +211,12 @@ This creates N×N tensors for dx, dy, min_sep_x, min_sep_y, overlap_x, overlap_y
 | 12  | (test 12, 100K cells) | **0.0000** | 0.6492 | 721.77s | 12 |
 | 13  | + GD WL polish → re-legalize | 0.0000 | **0.4971** | 45.28s | 1-10 |
 
-**Run 13 notes:** Added gradient WL polish: 3 cycles of (GD on WL only → re-legalize → repair). WL improved 0.5132→0.4971 (~3%). The bottleneck is now legalization quality — strict row packing adds ~0.05 WL penalty each time. GD achieves 0.40 WL but legalization bumps it to 0.45+. Competitors with 0.13 WL use minimal-disturbance legalization + cell swaps — a fundamentally different approach. Next: optuna tuning of GD hyperparams, or better legalization that preserves WL.
+**Run 13 notes:** GD polish + cell swaps. WL 0.5132→0.4912.
+
+**Run 14 (optuna): 30 trials on tests 1,4,7,8. Best WL: 0.4544 (all tests). 0.0000 overlap.**
+Best config: lr=0.003, lambda_wl=1.16, lambda_overlap 13→139, beta 0.71→2.09, 500 epochs, warmup LR.
+Key insight: softer beta (2.09 vs 6.0) + lower LR + fewer epochs beats our aggressive defaults.
+Saved: `ashvin/results/best_config.json`
 | —   | Old leaderboard #1 | 0.0000 | 0.1310 | 11.32s | 1-10 |
 
 **Run 6 notes:** Added config-driven solver with cosine LR + lambda ramping. Cosine LR slightly hurt vs constant. Infrastructure ready for optuna.
