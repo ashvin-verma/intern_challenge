@@ -186,11 +186,12 @@ def cell_swap_optimization(
 
 def barycentric_refinement(
     cell_features, pin_features, edge_list,
-    num_passes=15, step=0.3, num_macros=None,
+    num_passes=15, step=0.3, momentum=0.7, num_macros=None,
 ):
-    """Move each cell toward centroid of connected cells. Accept if no overlap.
+    """Move each cell toward centroid of connected cells with momentum.
 
-    Fast, no gradients, directly reduces WL geometrically.
+    Uses spatial hash for O(1) overlap checking. Momentum accumulates
+    velocity across passes for smoother convergence.
     """
     start_time = time.perf_counter()
     N = cell_features.shape[0]
@@ -204,57 +205,85 @@ def barycentric_refinement(
     widths = cell_features[:, 4].detach()
     heights = cell_features[:, 5].detach()
 
-    # Build cell adjacency (vectorized)
+    # Build cell adjacency
     pin_to_cell = pin_features[:, 0].long()
-    cell_neighbors = [[] for _ in range(N)]
+    cell_neighbors = [set() for _ in range(N)]
     for e in range(edge_list.shape[0]):
         sc = pin_to_cell[edge_list[e, 0].item()].item()
         tc = pin_to_cell[edge_list[e, 1].item()].item()
         if sc != tc:
-            cell_neighbors[sc].append(tc)
-            cell_neighbors[tc].append(sc)
+            cell_neighbors[sc].add(tc)
+            cell_neighbors[tc].add(sc)
+    cell_neighbors = [list(s) for s in cell_neighbors]
 
-    # Precompute neighbor sets (deduplicate)
-    cell_neighbors = [list(set(n)) for n in cell_neighbors]
+    # Momentum velocity per cell
+    velocity_x = [0.0] * N
+    velocity_y = [0.0] * N
 
     total_moves = 0
     actual_passes = 0
 
     for p in range(num_passes):
+        # Build spatial hash for fast overlap checking
+        bin_size = max(widths.max().item(), 3.0)
+        x_min = positions[:, 0].min().item() - bin_size
+        y_min = positions[:, 1].min().item() - bin_size
+
+        bin_to_cells = defaultdict(list)
+        cell_to_bin = {}
+        for i in range(N):
+            bx = int((positions[i, 0].item() - x_min) / bin_size)
+            by = int((positions[i, 1].item() - y_min) / bin_size)
+            bin_to_cells[(bx, by)].append(i)
+            cell_to_bin[i] = (bx, by)
+
         moves = 0
-        for i in range(num_macros, N):  # only std cells
+        for i in range(num_macros, N):
             nbrs = cell_neighbors[i]
             if not nbrs:
                 continue
 
-            # Centroid of neighbors
+            # Barycentric target
             cx = sum(positions[n, 0].item() for n in nbrs) / len(nbrs)
             cy = sum(positions[n, 1].item() for n in nbrs) / len(nbrs)
 
             old_x = positions[i, 0].item()
             old_y = positions[i, 1].item()
-            new_x = old_x + step * (cx - old_x)
-            new_y = old_y + step * (cy - old_y)
 
-            # Try move
+            # Apply momentum: velocity = momentum * old_velocity + step * gradient
+            grad_x = cx - old_x
+            grad_y = cy - old_y
+            velocity_x[i] = momentum * velocity_x[i] + step * grad_x
+            velocity_y[i] = momentum * velocity_y[i] + step * grad_y
+
+            new_x = old_x + velocity_x[i]
+            new_y = old_y + velocity_y[i]
+
+            # Spatial hash overlap check (O(neighbors) not O(N))
             positions[i, 0] = new_x
             positions[i, 1] = new_y
 
-            # Quick overlap check against nearby cells (just check same-size cells in vicinity)
             w = widths[i].item()
             h = heights[i].item()
+            bx_c, by_c = cell_to_bin[i]
             has_overlap = False
-            for j in range(N):
-                if j == i:
-                    continue
-                if abs(new_x - positions[j, 0].item()) < (w + widths[j].item()) / 2 and \
-                   abs(new_y - positions[j, 1].item()) < (h + heights[j].item()) / 2:
-                    has_overlap = True
+            for dbx in (-1, 0, 1):
+                if has_overlap:
                     break
+                for dby in (-1, 0, 1):
+                    for j in bin_to_cells.get((bx_c + dbx, by_c + dby), []):
+                        if j == i:
+                            continue
+                        if abs(new_x - positions[j, 0].item()) < (w + widths[j].item()) / 2 and \
+                           abs(new_y - positions[j, 1].item()) < (h + heights[j].item()) / 2:
+                            has_overlap = True
+                            break
 
             if has_overlap:
                 positions[i, 0] = old_x
                 positions[i, 1] = old_y
+                velocity_x[i] = 0.0  # reset momentum on collision
+                velocity_y[i] = 0.0
             else:
                 moves += 1
 

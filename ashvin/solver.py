@@ -163,7 +163,7 @@ def solve(
 
     # Phase 1: Initial legalization (guarantee zero overlap)
     for leg_pass in range(5):
-        leg_stats = legalize(cell_features)
+        leg_stats = legalize(cell_features, pin_features=pin_features, edge_list=edge_list)
         legalize_time += leg_stats["time"]
         rep_stats = repair_overlaps(cell_features, max_iterations=repair_iterations)
         repair_time += rep_stats["time"]
@@ -211,7 +211,7 @@ def solve(
 
         # Pass D: Re-legalize
         for _lp in range(3):
-            legalize(cell_features)
+            legalize(cell_features, pin_features=pin_features, edge_list=edge_list)
             rep = repair_overlaps(cell_features, max_iterations=100)
             if rep["overlaps_after"] == 0:
                 break

@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 
 
-def legalize(cell_features, num_macros=None):
+def legalize(cell_features, num_macros=None, pin_features=None, edge_list=None):
     """Deterministic legalization: remove all overlaps via greedy packing.
 
     Modifies cell_features[:, 2:4] in-place.
@@ -126,10 +126,33 @@ def legalize(cell_features, num_macros=None):
     if num_macros < N:
         std_indices = list(range(num_macros, N))
 
-        # Sort std cells by their current x position (preserve relative order)
-        std_x = positions[std_indices, 0]
-        sort_order = torch.argsort(std_x)
-        sorted_std = [std_indices[i] for i in sort_order.tolist()]
+        # WL-aware sort: group cells by nearest macro region, then by x within region
+        if pin_features is not None and edge_list is not None and num_macros > 0:
+            from collections import Counter
+            pin_to_cell = pin_features[:, 0].long()
+            # Find each std cell's most-connected macro
+            cell_macro_affinity = {}
+            for e in range(edge_list.shape[0]):
+                sc = pin_to_cell[edge_list[e, 0].item()].item()
+                tc = pin_to_cell[edge_list[e, 1].item()].item()
+                if sc < num_macros and tc >= num_macros:
+                    cell_macro_affinity.setdefault(tc, Counter())[sc] += 1
+                elif tc < num_macros and sc >= num_macros:
+                    cell_macro_affinity.setdefault(sc, Counter())[tc] += 1
+
+            # Sort by: (macro_region_x, cell_x) so cells near same macro pack together
+            def sort_key(idx):
+                if idx in cell_macro_affinity:
+                    best_macro = cell_macro_affinity[idx].most_common(1)[0][0]
+                    return (positions[best_macro, 0].item(), positions[idx, 0].item())
+                return (positions[idx, 0].item(), positions[idx, 0].item())
+
+            sorted_std = sorted(std_indices, key=sort_key)
+        else:
+            # Fallback: sort by x position
+            std_x = positions[std_indices, 0]
+            sort_order = torch.argsort(std_x)
+            sorted_std = [std_indices[i] for i in sort_order.tolist()]
 
         # Collect all macro bounding boxes as obstacles
         obstacles = []
