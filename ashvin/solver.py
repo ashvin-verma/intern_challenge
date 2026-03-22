@@ -148,6 +148,10 @@ def solve(
         if repair_after == 0:
             break
 
+    # WL optimization: gradient polish → re-legalize cycles
+    from ashvin.wl_optimize import gradient_wl_polish
+    wl_stats = gradient_wl_polish(cell_features, pin_features, edge_list)
+
     train_end = time.perf_counter()
 
     return {

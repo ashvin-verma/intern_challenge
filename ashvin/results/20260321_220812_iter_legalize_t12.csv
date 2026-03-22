@@ -1,0 +1,2 @@
+timestamp,test_id,num_macros,num_std_cells,total_cells,num_nets,seed,overlap_ratio,num_cells_with_overlaps,normalized_wl,elapsed_time,train_time,wl_loss_time,overlap_loss_time,density_loss_time,backward_time,optimizer_time,eval_time,skipped_eval,tag
+20260321_220812,12,10,100000,100010,902282,1012,0.0,0,0.6491670971622138,721.766628228,706.9476345119999,2.8658240099997556,44.99795872000044,0.521124273999817,20.239168327999664,0.13282375400001456,3.048975229000007,False,iter_legalize_t12
