@@ -347,17 +347,32 @@ def overlap_repulsion_loss(cell_features, pin_features, edge_list):
     if N <= 1:
         return torch.tensor(0.0, requires_grad=True)
 
-    # TODO: Implement overlap detection and loss calculation here
-    #
-    # Your implementation should:
-    # 1. Extract cell positions, widths, and heights
-    # 2. Compute pairwise overlaps using vectorized operations
-    # 3. Return a scalar loss that is zero when no overlaps exist
-    #
-    # Delete this placeholder and add your implementation:
+    # Use scalable spatial-hash approach for large designs
+    if N >= 500:
+        from ashvin.overlap import scalable_overlap_loss
+        return scalable_overlap_loss(cell_features)
 
-    # Placeholder - returns a constant loss (REPLACE THIS!)
-    return torch.tensor(1.0, requires_grad=True)
+    # Naive N×N approach for small designs
+    x = cell_features[:, 2]
+    y = cell_features[:, 3]
+    w = cell_features[:, 4]
+    h = cell_features[:, 5]
+
+    dx = torch.abs(x.unsqueeze(1) - x.unsqueeze(0))
+    dy = torch.abs(y.unsqueeze(1) - y.unsqueeze(0))
+
+    min_sep_x = (w.unsqueeze(1) + w.unsqueeze(0)) / 2
+    min_sep_y = (h.unsqueeze(1) + h.unsqueeze(0)) / 2
+
+    overlap_x = torch.relu(min_sep_x - dx)
+    overlap_y = torch.relu(min_sep_y - dy)
+
+    overlap_area = overlap_x * overlap_y
+
+    mask = torch.triu(torch.ones(N, N, dtype=torch.bool, device=overlap_area.device), diagonal=1)
+    overlap_area = overlap_area[mask]
+
+    return overlap_area.sum() / N
 
 
 def train_placement(
@@ -368,6 +383,7 @@ def train_placement(
     lr=0.01,
     lambda_wirelength=1.0,
     lambda_overlap=10.0,
+    lambda_density=0.0,
     verbose=True,
     log_interval=100,
 ):
@@ -381,6 +397,7 @@ def train_placement(
         lr: Learning rate for Adam optimizer
         lambda_wirelength: Weight for wirelength loss
         lambda_overlap: Weight for overlap loss
+        lambda_density: Weight for density loss (0.0 = disabled)
         verbose: Whether to print progress
         log_interval: How often to print progress
 
@@ -424,8 +441,15 @@ def train_placement(
             cell_features_current, pin_features, edge_list
         )
 
+        # Density loss (if enabled)
+        if lambda_density > 0:
+            from ashvin.density import density_loss as _density_loss
+            d_loss = _density_loss(cell_features_current)
+        else:
+            d_loss = torch.tensor(0.0)
+
         # Combined loss
-        total_loss = lambda_wirelength * wl_loss + lambda_overlap * overlap_loss
+        total_loss = lambda_wirelength * wl_loss + lambda_overlap * overlap_loss + lambda_density * d_loss
 
         # Backward pass
         total_loss.backward()
@@ -478,6 +502,12 @@ def calculate_overlap_metrics(cell_features):
             - overlap_percentage: percentage of total area that overlaps (float)
     """
     N = cell_features.shape[0]
+
+    # Use scalable spatial-hash approach for large designs
+    if N >= 500:
+        from ashvin.overlap import scalable_overlap_metrics
+        return scalable_overlap_metrics(cell_features)
+
     if N <= 1:
         return {
             "overlap_count": 0,
@@ -546,6 +576,11 @@ def calculate_cells_with_overlaps(cell_features):
     N = cell_features.shape[0]
     if N <= 1:
         return set()
+
+    # Use scalable spatial-hash approach for large designs
+    if N >= 500:
+        from ashvin.overlap import scalable_cells_with_overlaps
+        return scalable_cells_with_overlaps(cell_features)
 
     # Extract cell properties
     positions = cell_features[:, 2:4].detach().numpy()
