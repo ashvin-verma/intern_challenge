@@ -205,8 +205,10 @@ This creates N×N tensors for dx, dy, min_sep_x, min_sep_y, overlap_x, overlap_y
 | 8   | + deterministic legalization | 0.0093 | 0.5197 | 51.03s | 1-10 |
 | 9   | Fixed legalization edge cases | 0.0011 | 0.5200 | 47.99s | 1-10 |
 | 10  | + brute-force repair + adaptive epochs | 0.0001 | 0.5200 | ~48s | 1-10 |
-| **11** | **+ macro repair in legalization** | **0.0000** | **0.5132** | **40.51s** | **1-10** |
-| 11  | (test 11, 10K cells) | 0.0000 | 0.6064 | 9.71s | 11 |
+| 11  | + macro repair in legalization | 0.0000 | 0.5132 | 40.51s | 1-10 |
+| **12** | **+ iterative legalize-repair** | **0.0000** | **0.5132** | **40.51s** | **1-10** |
+| 12  | (test 11) | 0.0000 | 0.6064 | 9.61s | 11 |
+| 12  | (test 12, 100K cells) | **0.0000** | 0.6492 | 721.77s | 12 |
 | —   | Old leaderboard #1 | 0.0000 | 0.1310 | 11.32s | 1-10 |
 
 **Run 6 notes:** Added config-driven solver with cosine LR + lambda ramping. Cosine LR slightly hurt vs constant. Infrastructure ready for optuna.

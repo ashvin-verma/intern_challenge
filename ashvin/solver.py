@@ -125,12 +125,28 @@ def solve(
 
     cell_features[:, 2:4] = pos.detach()
 
-    # Legalization + repair pass
+    # Iterative legalization + repair until zero overlap
     from ashvin.legalize import legalize
-    legalize_stats = legalize(cell_features)
-    repair_stats = repair_overlaps(
-        cell_features, max_iterations=repair_iterations
-    )
+    legalize_time = 0.0
+    repair_time = 0.0
+    repair_before = 0
+    repair_after = 0
+
+    for leg_pass in range(5):  # max 5 legalize-repair cycles
+        leg_stats = legalize(cell_features)
+        legalize_time += leg_stats["time"]
+
+        rep_stats = repair_overlaps(
+            cell_features, max_iterations=repair_iterations
+        )
+        repair_time += rep_stats["time"]
+
+        if leg_pass == 0:
+            repair_before = rep_stats["overlaps_before"]
+        repair_after = rep_stats["overlaps_after"]
+
+        if repair_after == 0:
+            break
 
     train_end = time.perf_counter()
 
@@ -145,9 +161,9 @@ def solve(
             "backward_time": backward_time,
             "optimizer_time": optimizer_time,
             "total_train_time": train_end - train_start,
-            "legalize_time": legalize_stats["time"],
-            "repair_time": repair_stats["time"],
-            "repair_before": repair_stats["overlaps_before"],
-            "repair_after": repair_stats["overlaps_after"],
+            "legalize_time": legalize_time,
+            "repair_time": repair_time,
+            "repair_before": repair_before,
+            "repair_after": repair_after,
         },
     }
