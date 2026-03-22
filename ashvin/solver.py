@@ -148,45 +148,86 @@ def solve(
 
     cell_features[:, 2:4] = pos.detach()
 
-    # Iterative legalization + repair until zero overlap
+    # === MULTI-PASS PIPELINE (compiler-style) ===
     from ashvin.legalize import legalize
+    from ashvin.wl_optimize import barycentric_refinement, targeted_scatter_reconverge
+
+    skip_scatter = config.get("_skip_scatter", False) if config else False
+    max_scatters = config.get("max_scatters", 3) if config else 3
+    num_macros_det = (cell_features[:, 5] > 1.5).sum().item()
+
     legalize_time = 0.0
     repair_time = 0.0
     repair_before = 0
     repair_after = 0
 
-    for leg_pass in range(5):  # max 5 legalize-repair cycles
+    # Phase 1: Initial legalization (guarantee zero overlap)
+    for leg_pass in range(5):
         leg_stats = legalize(cell_features)
         legalize_time += leg_stats["time"]
-
-        rep_stats = repair_overlaps(
-            cell_features, max_iterations=repair_iterations
-        )
+        rep_stats = repair_overlaps(cell_features, max_iterations=repair_iterations)
         repair_time += rep_stats["time"]
-
         if leg_pass == 0:
             repair_before = rep_stats["overlaps_before"]
         repair_after = rep_stats["overlaps_after"]
-
         if repair_after == 0:
             break
 
-    # Barycentric WL refinement
-    from ashvin.wl_optimize import barycentric_refinement
-    bary_stats = barycentric_refinement(cell_features, pin_features, edge_list)
+    # Phase 2: Fixed-point WL optimization loop
+    from placement import calculate_normalized_metrics
+    best_wl = calculate_normalized_metrics(cell_features, pin_features, edge_list)["normalized_wl"]
+    best_features = cell_features.clone()
 
-    # Iterative targeted scatter: repeatedly fix high-WL clusters
-    skip_scatter = config.get("_skip_scatter", False) if config else False
-    max_scatters = config.get("max_scatters", 3) if config else 3
-    if not skip_scatter and N <= 5000:
-        from ashvin.wl_optimize import targeted_scatter_reconverge
-        for _sc in range(max_scatters):
+    pipeline_passes = config.get("pipeline_passes", 3) if config else 3
+    for pipe_iter in range(pipeline_passes):
+        improved_this_iter = False
+
+        # Pass A: Barycentric refinement (fast, local)
+        bary_stats = barycentric_refinement(cell_features, pin_features, edge_list)
+
+        # Pass B: Targeted scatter + reconverge (break local minima)
+        if not skip_scatter and N <= 5000:
             scatter_result = targeted_scatter_reconverge(
                 cell_features, pin_features, edge_list, config=config
             )
-            if scatter_result is None:
-                break  # no improvement found
-            cell_features[:] = scatter_result["final_cell_features"]
+            if scatter_result is not None:
+                cell_features[:] = scatter_result["final_cell_features"]
+
+        # Pass C: Short GD on WL only + re-legalize
+        std_pos = cell_features[num_macros_det:, 2:4].clone().detach()
+        std_pos.requires_grad_(True)
+        macro_pos = cell_features[:num_macros_det, 2:4].detach()
+        opt_wl = optim.Adam([std_pos], lr=0.003)
+        for _ep in range(100):
+            opt_wl.zero_grad()
+            full_pos = torch.cat([macro_pos, std_pos], dim=0)
+            cf_tmp = cell_features.clone()
+            cf_tmp[:, 2:4] = full_pos
+            wl_l = wirelength_attraction_loss(cf_tmp, pin_features, edge_list)
+            wl_l.backward()
+            torch.nn.utils.clip_grad_norm_([std_pos], max_norm=1.0)
+            opt_wl.step()
+        cell_features[:, 2:4] = torch.cat([macro_pos, std_pos.detach()], dim=0)
+
+        # Pass D: Re-legalize
+        for _lp in range(3):
+            legalize(cell_features)
+            rep = repair_overlaps(cell_features, max_iterations=100)
+            if rep["overlaps_after"] == 0:
+                break
+
+        # Check if this iteration improved WL
+        cur_m = calculate_normalized_metrics(cell_features, pin_features, edge_list)
+        if cur_m["overlap_ratio"] == 0 and cur_m["normalized_wl"] < best_wl:
+            best_wl = cur_m["normalized_wl"]
+            best_features = cell_features.clone()
+            improved_this_iter = True
+
+        if not improved_this_iter:
+            cell_features[:] = best_features  # revert to best
+            break
+
+    cell_features[:] = best_features
 
     train_end = time.perf_counter()
 

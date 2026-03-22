@@ -231,7 +231,22 @@ Key insight: higher lambda_wl (3.58) + warmup_cosine LR + low overlap start (1.2
 
 **Run 21 (nuclear/SEMF loss): Lennard-Jones and SEMF-inspired potentials. WL: 0.4453.** Negligible impact — redundant with existing WL loss. The attraction term doesn't add information beyond what wirelength_attraction_loss already provides.
 
-**Current best config:** `ashvin/results/best_config.json` + 3 scatter iterations.
+**Run 22 (multi-pass pipeline): Compiler-style optimization passes. WL: 0.3695 (tests 1-10).**
+Pipeline: legalize → [barycentric → scatter → GD(WL-only, 100ep) → re-legalize] × 3 passes.
+Best-so-far tracking with revert. Small improvement over scatter-only (0.3717→0.3695).
+Bottleneck: barycentric has O(N²) overlap check, slow on test 10.
+
+**Current best config:** `ashvin/results/best_config.json` + 3 pipeline passes + scatter.
+**Current best avg WL: 0.3687 (tests 1-10), 0.0000 overlap.**
+
+**What's stopping #1 (0.13 WL):**
+- Legalization adds 0.05-0.15 WL penalty per application (row packing is connectivity-blind)
+- GD gets positions to ~0.25 WL but legalization bumps to ~0.35+
+- #1 (Shashank) uses 5+ heuristic passes: constructive init, shelf-based refinement,
+  cell swaps targeting specific high-WL edges, barycentric within size groups,
+  multiple legalization+polish cycles
+- This is fundamentally a different architecture — a compiler with optimization passes
+  vs our single GD+legalize+scatter pipeline
 | 15  | Optuna v3 (100 trials) | 0.0000 | 0.4091 | ~45s | 1-10 |
 | 20  | + multi-scatter (3 iters) | 0.0000 | **0.3842** | ~90s | 1-9 |
 | —   | Old leaderboard #1 | 0.0000 | 0.1310 | 11.32s | 1-10 |
