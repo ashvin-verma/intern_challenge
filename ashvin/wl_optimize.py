@@ -184,6 +184,89 @@ def cell_swap_optimization(
     }
 
 
+def barycentric_refinement(
+    cell_features, pin_features, edge_list,
+    num_passes=15, step=0.3, num_macros=None,
+):
+    """Move each cell toward centroid of connected cells. Accept if no overlap.
+
+    Fast, no gradients, directly reduces WL geometrically.
+    """
+    start_time = time.perf_counter()
+    N = cell_features.shape[0]
+    if N <= 1:
+        return {"time": 0.0, "moves": 0, "passes": 0}
+
+    if num_macros is None:
+        num_macros = (cell_features[:, 5] > 1.5).sum().item()
+
+    positions = cell_features[:, 2:4].detach()
+    widths = cell_features[:, 4].detach()
+    heights = cell_features[:, 5].detach()
+
+    # Build cell adjacency (vectorized)
+    pin_to_cell = pin_features[:, 0].long()
+    cell_neighbors = [[] for _ in range(N)]
+    for e in range(edge_list.shape[0]):
+        sc = pin_to_cell[edge_list[e, 0].item()].item()
+        tc = pin_to_cell[edge_list[e, 1].item()].item()
+        if sc != tc:
+            cell_neighbors[sc].append(tc)
+            cell_neighbors[tc].append(sc)
+
+    # Precompute neighbor sets (deduplicate)
+    cell_neighbors = [list(set(n)) for n in cell_neighbors]
+
+    total_moves = 0
+    actual_passes = 0
+
+    for p in range(num_passes):
+        moves = 0
+        for i in range(num_macros, N):  # only std cells
+            nbrs = cell_neighbors[i]
+            if not nbrs:
+                continue
+
+            # Centroid of neighbors
+            cx = sum(positions[n, 0].item() for n in nbrs) / len(nbrs)
+            cy = sum(positions[n, 1].item() for n in nbrs) / len(nbrs)
+
+            old_x = positions[i, 0].item()
+            old_y = positions[i, 1].item()
+            new_x = old_x + step * (cx - old_x)
+            new_y = old_y + step * (cy - old_y)
+
+            # Try move
+            positions[i, 0] = new_x
+            positions[i, 1] = new_y
+
+            # Quick overlap check against nearby cells (just check same-size cells in vicinity)
+            w = widths[i].item()
+            h = heights[i].item()
+            has_overlap = False
+            for j in range(N):
+                if j == i:
+                    continue
+                if abs(new_x - positions[j, 0].item()) < (w + widths[j].item()) / 2 and \
+                   abs(new_y - positions[j, 1].item()) < (h + heights[j].item()) / 2:
+                    has_overlap = True
+                    break
+
+            if has_overlap:
+                positions[i, 0] = old_x
+                positions[i, 1] = old_y
+            else:
+                moves += 1
+
+        total_moves += moves
+        actual_passes = p + 1
+        if moves == 0:
+            break
+
+    cell_features[:, 2:4] = positions
+    return {"time": time.perf_counter() - start_time, "moves": total_moves, "passes": actual_passes}
+
+
 def gradient_wl_polish(
     cell_features, pin_features, edge_list,
     epochs=200, lr=0.005,

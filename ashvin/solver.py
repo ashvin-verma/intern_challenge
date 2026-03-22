@@ -162,12 +162,9 @@ def solve(
         if repair_after == 0:
             break
 
-    # WL optimization: gradient polish → cell swaps (skip during tuning)
-    skip_wl = config.get("_skip_wl_polish", False) if config else False
-    if not skip_wl:
-        from ashvin.wl_optimize import gradient_wl_polish, cell_swap_optimization
-        wl_stats = gradient_wl_polish(cell_features, pin_features, edge_list)
-        swap_stats = cell_swap_optimization(cell_features, pin_features, edge_list)
+    # Barycentric WL refinement (fast, always on)
+    from ashvin.wl_optimize import barycentric_refinement
+    bary_stats = barycentric_refinement(cell_features, pin_features, edge_list)
 
     train_end = time.perf_counter()
 
@@ -188,6 +185,67 @@ def solve(
             "repair_after": repair_after,
         },
     }
+
+
+def solve_scatter(cell_features, pin_features, edge_list, config=None, verbose=False):
+    """Explosive scatter + reconverge: escape local minima.
+
+    1. GD for 300 epochs (converge)
+    2. Scatter positions outward from centroid
+    3. GD for 200 more epochs (reconverge)
+    4. Try 3 scatter magnitudes, keep best
+    5. Legalize + repair + barycentric
+    """
+    from placement import calculate_normalized_metrics
+
+    N = cell_features.shape[0]
+    best_result = None
+    best_wl = float("inf")
+
+    scatter_factors = [1.0, 1.3, 1.5, 2.0]  # 1.0 = no scatter (baseline)
+
+    for scatter in scatter_factors:
+        cf = cell_features.clone()
+
+        # Build config for this run
+        run_config = dict(config) if config else {}
+        run_config["_skip_wl_polish"] = True  # barycentric is in solve() already
+
+        if scatter == 1.0:
+            # Normal run (baseline)
+            result = solve(cf, pin_features, edge_list, config=run_config, verbose=False)
+        else:
+            # Phase 1: short GD
+            phase1_config = dict(run_config)
+            phase1_config["epochs"] = 300
+            result = solve(cf, pin_features, edge_list, config=phase1_config, verbose=False)
+
+            # Scatter from centroid
+            pos = result["final_cell_features"][:, 2:4]
+            cx = pos[:, 0].mean()
+            cy = pos[:, 1].mean()
+            pos[:, 0] = cx + (pos[:, 0] - cx) * scatter
+            pos[:, 1] = cy + (pos[:, 1] - cy) * scatter
+            cf = result["final_cell_features"].clone()
+            cf[:, 2:4] = pos
+
+            # Phase 2: reconverge
+            phase2_config = dict(run_config)
+            phase2_config["epochs"] = 200
+            result = solve(cf, pin_features, edge_list, config=phase2_config, verbose=False)
+
+        m = calculate_normalized_metrics(result["final_cell_features"], pin_features, edge_list)
+        if verbose:
+            print(f"  scatter={scatter:.1f}: overlap={m['overlap_ratio']:.4f} wl={m['normalized_wl']:.4f}")
+
+        if m["overlap_ratio"] == 0 and m["normalized_wl"] < best_wl:
+            best_wl = m["normalized_wl"]
+            best_result = result
+
+    if best_result is None:
+        best_result = solve(cell_features, pin_features, edge_list, config=config, verbose=verbose)
+
+    return best_result
 
 
 def solve_multistart(cell_features, pin_features, edge_list, config=None, verbose=False):
