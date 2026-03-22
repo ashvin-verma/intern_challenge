@@ -237,7 +237,10 @@ Best-so-far tracking with revert. Small improvement over scatter-only (0.3717→
 Bottleneck: barycentric has O(N²) overlap check, slow on test 10.
 
 **Current best config:** `ashvin/results/best_config.json` + 3 pipeline passes + scatter.
-**Current best avg WL: 0.3687 (tests 1-10), 0.0000 overlap.**
+**Run 23 (detailed placement): pair swaps + reinsertion (N≤300). WL: 0.3540 (tests 1-10). 0.0000 overlap.**
+Best per-test: test 7=0.3059, test 10=0.2292. Detailed swaps help small/medium tests most.
+
+**Current best avg WL: 0.3540 (tests 1-10), 0.0000 overlap. Rank ~9.**
 
 **What's stopping #1 (0.13 WL):**
 - Legalization adds 0.05-0.15 WL penalty per application (row packing is connectivity-blind)
