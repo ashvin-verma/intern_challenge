@@ -162,9 +162,19 @@ def solve(
         if repair_after == 0:
             break
 
-    # Barycentric WL refinement (fast, always on)
+    # Barycentric WL refinement
     from ashvin.wl_optimize import barycentric_refinement
     bary_stats = barycentric_refinement(cell_features, pin_features, edge_list)
+
+    # Targeted scatter: move hot-WL cells toward neighbors, re-solve
+    skip_scatter = config.get("_skip_scatter", False) if config else False
+    if not skip_scatter and N <= 5000:
+        from ashvin.wl_optimize import targeted_scatter_reconverge
+        scatter_result = targeted_scatter_reconverge(
+            cell_features, pin_features, edge_list, config=config
+        )
+        if scatter_result is not None:
+            cell_features[:] = scatter_result["final_cell_features"]
 
     train_end = time.perf_counter()
 

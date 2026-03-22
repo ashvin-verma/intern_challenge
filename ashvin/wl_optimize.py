@@ -267,6 +267,83 @@ def barycentric_refinement(
     return {"time": time.perf_counter() - start_time, "moves": total_moves, "passes": actual_passes}
 
 
+def targeted_scatter_reconverge(cell_features, pin_features, edge_list, config=None):
+    """Identify high-WL cells, scatter toward neighbors, re-solve.
+
+    Finds cells with long edges (top 20%), moves them 50% toward their
+    connected neighbors' centroid, then runs a short GD + legalize.
+    Returns improved result or None if no improvement.
+    """
+    from ashvin.solver import solve
+    from ashvin.overlap import _pair_cache
+    from placement import calculate_normalized_metrics
+
+    N = cell_features.shape[0]
+    num_macros = (cell_features[:, 5] > 1.5).sum().item()
+    pos = cell_features[:, 2:4].detach()
+    pin_to_cell = pin_features[:, 0].long()
+
+    # Current WL
+    m_before = calculate_normalized_metrics(cell_features, pin_features, edge_list)
+    if m_before["overlap_ratio"] > 0:
+        return None
+
+    # Build adjacency
+    cell_neighbors = [set() for _ in range(N)]
+    for e in range(edge_list.shape[0]):
+        sc = pin_to_cell[edge_list[e, 0].item()].item()
+        tc = pin_to_cell[edge_list[e, 1].item()].item()
+        if sc != tc:
+            cell_neighbors[sc].add(tc)
+            cell_neighbors[tc].add(sc)
+
+    # Per-edge WL
+    edge_wl = []
+    for e in range(edge_list.shape[0]):
+        sp, tp = edge_list[e, 0].item(), edge_list[e, 1].item()
+        sc, tc = pin_to_cell[sp].item(), pin_to_cell[tp].item()
+        dx = abs(pos[sc, 0].item() + pin_features[sp, 1].item()
+                 - pos[tc, 0].item() - pin_features[tp, 1].item())
+        dy = abs(pos[sc, 1].item() + pin_features[sp, 2].item()
+                 - pos[tc, 1].item() - pin_features[tp, 2].item())
+        edge_wl.append((dx + dy, sc, tc))
+
+    edge_wl.sort(reverse=True)
+    hot_cells = set()
+    for wl_val, sc, tc in edge_wl[:len(edge_wl) // 5]:
+        if sc >= num_macros:
+            hot_cells.add(sc)
+        if tc >= num_macros:
+            hot_cells.add(tc)
+
+    if not hot_cells:
+        return None
+
+    # Scatter hot cells toward neighbor centroids
+    cf2 = cell_features.clone()
+    for i in hot_cells:
+        nbrs = list(cell_neighbors[i])
+        if nbrs:
+            cx = sum(pos[n, 0].item() for n in nbrs) / len(nbrs)
+            cy = sum(pos[n, 1].item() for n in nbrs) / len(nbrs)
+            cf2[i, 2] = pos[i, 0] + 0.5 * (cx - pos[i, 0].item())
+            cf2[i, 3] = pos[i, 1] + 0.5 * (cy - pos[i, 1].item())
+
+    # Short re-solve
+    scatter_config = dict(config) if config else {}
+    scatter_config["epochs"] = 200
+    scatter_config["_skip_scatter"] = True  # prevent recursion
+    _pair_cache["pairs"] = None
+    _pair_cache["call_count"] = 0
+
+    result = solve(cf2, pin_features, edge_list, config=scatter_config, verbose=False)
+
+    m_after = calculate_normalized_metrics(result["final_cell_features"], pin_features, edge_list)
+    if m_after["overlap_ratio"] == 0 and m_after["normalized_wl"] < m_before["normalized_wl"]:
+        return result
+    return None
+
+
 def gradient_wl_polish(
     cell_features, pin_features, edge_list,
     epochs=200, lr=0.005,
