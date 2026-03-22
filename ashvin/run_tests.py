@@ -295,6 +295,11 @@ def main():
         choices=["annealed"],
         help="Solver type (annealed = single-stage competitor-inspired)",
     )
+    parser.add_argument(
+        "--no-wl-polish",
+        action="store_true",
+        help="Skip WL polish + cell swap (faster)",
+    )
     args = parser.parse_args()
 
     test_ids = None
@@ -302,7 +307,9 @@ def main():
         test_ids = [int(x) for x in args.tests.split(",")]
 
     # Load config
-    solver_config = None
+    solver_config = {}
+    if args.no_wl_polish:
+        solver_config["_skip_wl_polish"] = True
     if args.config:
         from ashvin.config import PRESETS
         if args.config in PRESETS:
@@ -315,7 +322,7 @@ def main():
     results = run_all_tests(
         test_ids=test_ids, max_cells_for_eval=args.max_cells,
         lambda_density=args.lambda_density, two_stage=args.two_stage,
-        config=solver_config, solver_type=args.solver,
+        config=solver_config or None, solver_type=args.solver,
     )
     print_summary(results)
     save_results_csv(results, tag=args.tag)

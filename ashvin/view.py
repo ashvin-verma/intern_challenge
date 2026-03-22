@@ -33,7 +33,7 @@ TEST_CASES = {
 OUTPUT_DIR = Path(__file__).resolve().parent / "plots"
 
 
-def plot_test(test_id, initial_features, final_features, num_macros, pin_features, edge_list, version=""):
+def plot_test(test_id, initial_features, final_features, num_macros, pin_features, edge_list, version="", show_edges=True):
     """Plot initial vs final placement with macro/std cell distinction and overlap highlighting."""
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
@@ -86,13 +86,36 @@ def plot_test(test_id, initial_features, final_features, num_macros, pin_feature
             )
             ax.add_patch(rect)
 
+        # Draw edges on final placement only
+        if show_edges and title == "Final" and edge_list.shape[0] < 5000:
+            pin_to_cell = pin_features[:, 0].long().numpy()
+            for e in range(min(edge_list.shape[0], 3000)):
+                sp, tp = edge_list[e, 0].item(), edge_list[e, 1].item()
+                sc, tc = pin_to_cell[sp], pin_to_cell[tp]
+                sx = positions[sc, 0] + pin_features[sp, 1].item()
+                sy = positions[sc, 1] + pin_features[sp, 2].item()
+                tx = positions[tc, 0] + pin_features[tp, 1].item()
+                ty = positions[tc, 1] + pin_features[tp, 2].item()
+                length = abs(sx - tx) + abs(sy - ty)
+                color = "#e74c3c" if length > 20 else "#bdc3c7"
+                alpha_e = 0.6 if length > 20 else 0.15
+                ax.plot([sx, tx], [sy, ty], color=color, linewidth=0.3, alpha=alpha_e, zorder=0)
+
         metrics = calculate_overlap_metrics(cell_features) if N <= 3000 else {"overlap_count": "?", "total_overlap_area": "?"}
 
         ax.set_aspect("equal")
         ax.grid(True, alpha=0.2)
         overlap_str = f"{metrics['overlap_count']}" if isinstance(metrics['overlap_count'], int) else "?"
-        area_str = f"{metrics['total_overlap_area']:.0f}" if isinstance(metrics.get('total_overlap_area', '?'), float) else "?"
-        ax.set_title(f"{title}\nOverlap pairs: {overlap_str}, Area: {area_str}", fontsize=12)
+
+        # Compute WL for title
+        from placement import calculate_normalized_metrics
+        if title == "Final" and N <= 3000:
+            nm = calculate_normalized_metrics(cell_features, pin_features, edge_list)
+            wl_str = f", WL: {nm['normalized_wl']:.4f}"
+        else:
+            wl_str = ""
+
+        ax.set_title(f"{title}\nOverlap: {overlap_str}{wl_str}", fontsize=12)
 
         all_x = positions[:, 0]
         all_y = positions[:, 1]
@@ -145,6 +168,11 @@ def main():
         "--two-stage", action="store_true",
         help="Use two-stage training (macros first)",
     )
+    parser.add_argument(
+        "--solver", type=str, default=None,
+        choices=["annealed"],
+        help="Solver type",
+    )
     args = parser.parse_args()
 
     test_ids = [int(x) for x in args.tests.split(",")]
@@ -178,7 +206,10 @@ def main():
 
         initial_features = cell_features.clone()
 
-        if args.two_stage:
+        if args.solver == "annealed":
+            from ashvin.solver import solve
+            result = solve(cell_features, pin_features, edge_list)
+        elif args.two_stage:
             from ashvin.instrumented_train import two_stage_train_placement
             result = two_stage_train_placement(
                 cell_features, pin_features, edge_list,
