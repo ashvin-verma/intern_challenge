@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 
 from ashvin.instrumented_train import instrumented_train_placement, two_stage_train_placement
-from ashvin.solver import solve as annealed_solve
+from ashvin.solver import solve as annealed_solve, solve_multistart
 from placement import calculate_normalized_metrics, generate_placement_input
 
 # Same test cases as test.py
@@ -78,7 +78,12 @@ def run_single_test(test_id, num_macros, num_std_cells, seed, max_cells_for_eval
 
     # Instrumented training
     start_time = time.perf_counter()
-    if solver_type == "annealed":
+    if solver_type == "multistart":
+        result = solve_multistart(
+            cell_features, pin_features, edge_list,
+            config=config, verbose=True,
+        )
+    elif solver_type == "annealed":
         result = annealed_solve(
             cell_features, pin_features, edge_list,
             config=config,
@@ -292,7 +297,7 @@ def main():
         "--solver",
         type=str,
         default=None,
-        choices=["annealed"],
+        choices=["annealed", "multistart"],
         help="Solver type (annealed = single-stage competitor-inspired)",
     )
     parser.add_argument(

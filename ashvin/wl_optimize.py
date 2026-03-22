@@ -73,8 +73,7 @@ def cell_swap_optimization(
 ):
     """Swap nearby same-height cells if it improves WL without creating overlap.
 
-    Strategy: for each cell, try swapping with its spatial neighbors.
-    Accept if total WL of both cells' edges decreases and no new overlap.
+    Uses spatial hash for fast overlap checking (O(1) per swap instead of O(N)).
 
     Returns dict with stats.
     """
@@ -95,91 +94,83 @@ def cell_swap_optimization(
     total_swaps = 0
 
     for pass_num in range(num_passes):
-        # Build spatial index
-        bin_size = max(widths[num_macros:].max().item() * 3, 5.0) if num_macros < N else 10.0
+        # Build spatial index for overlap checking
+        bin_size = max(widths.max().item(), 3.0)
         x_min = positions[:, 0].min().item() - bin_size
         y_min = positions[:, 1].min().item() - bin_size
 
         bin_to_cells = defaultdict(list)
-        for i in range(num_macros, N):  # only std cells
+        cell_to_bin = {}
+        for i in range(N):
             bx = int((positions[i, 0].item() - x_min) / bin_size)
             by = int((positions[i, 1].item() - y_min) / bin_size)
             bin_to_cells[(bx, by)].append(i)
+            cell_to_bin[i] = (bx, by)
+
+        def get_nearby(cell_idx):
+            bx, by = cell_to_bin[cell_idx]
+            nearby = []
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    nearby.extend(bin_to_cells.get((bx + dx, by + dy), []))
+            return nearby
+
+        def check_overlap_fast(cell_idx):
+            """Check overlap using spatial hash — O(neighbors) not O(N)."""
+            x = positions[cell_idx, 0].item()
+            y = positions[cell_idx, 1].item()
+            w = widths[cell_idx].item()
+            h = heights[cell_idx].item()
+            for j in get_nearby(cell_idx):
+                if j == cell_idx:
+                    continue
+                if abs(x - positions[j, 0].item()) < (w + widths[j].item()) / 2 and \
+                   abs(y - positions[j, 1].item()) < (h + heights[j].item()) / 2:
+                    return True
+            return False
 
         swaps_this_pass = 0
 
+        # Only try swaps between std cells in same/adjacent bins
         for (bx, by), cells in bin_to_cells.items():
-            # Collect cells in this bin + right/bottom neighbors (avoid double-checking)
-            candidates = list(cells)
-            for nbx, nby in [(bx + 1, by), (bx, by + 1), (bx + 1, by + 1)]:
-                candidates.extend(bin_to_cells.get((nbx, nby), []))
+            std_cells = [c for c in cells if c >= num_macros]
+            # Neighbor bins (forward only to avoid double-checking)
+            for nbx, nby in [(bx, by), (bx + 1, by), (bx, by + 1)]:
+                nb_std = [c for c in bin_to_cells.get((nbx, nby), []) if c >= num_macros]
+                if nbx == bx and nby == by:
+                    nb_std = std_cells  # same bin
 
-            # Try swaps within candidates
-            for a_idx in range(len(cells)):
-                i = cells[a_idx]
-                hi = heights[i].item()
-                wi = widths[i].item()
+                for i in std_cells:
+                    hi = heights[i].item()
+                    for j in nb_std:
+                        if j <= i:
+                            continue
+                        if abs(hi - heights[j].item()) > 0.01:
+                            continue
 
-                for b_idx in range(len(candidates)):
-                    j = candidates[b_idx]
-                    if j <= i:
-                        continue  # avoid double-counting
+                        # Compute WL before
+                        wl_before = (_cell_wl_contribution(i, positions, pin_features, edge_list, pin_to_cell, cell_to_edges) +
+                                     _cell_wl_contribution(j, positions, pin_features, edge_list, pin_to_cell, cell_to_edges))
 
-                    # Only swap same-height cells (preserves row legality)
-                    hj = heights[j].item()
-                    if abs(hi - hj) > 0.01:
-                        continue
+                        # Swap
+                        pos_i = positions[i].clone()
+                        pos_j = positions[j].clone()
+                        positions[i] = pos_j
+                        positions[j] = pos_i
 
-                    # Compute WL before swap
-                    wl_i_before = _cell_wl_contribution(i, positions, pin_features, edge_list, pin_to_cell, cell_to_edges)
-                    wl_j_before = _cell_wl_contribution(j, positions, pin_features, edge_list, pin_to_cell, cell_to_edges)
-                    wl_before = wl_i_before + wl_j_before
+                        wl_after = (_cell_wl_contribution(i, positions, pin_features, edge_list, pin_to_cell, cell_to_edges) +
+                                    _cell_wl_contribution(j, positions, pin_features, edge_list, pin_to_cell, cell_to_edges))
 
-                    # Swap positions
-                    pos_i = positions[i].clone()
-                    pos_j = positions[j].clone()
-                    positions[i] = pos_j
-                    positions[j] = pos_i
-
-                    # Compute WL after swap
-                    wl_i_after = _cell_wl_contribution(i, positions, pin_features, edge_list, pin_to_cell, cell_to_edges)
-                    wl_j_after = _cell_wl_contribution(j, positions, pin_features, edge_list, pin_to_cell, cell_to_edges)
-                    wl_after = wl_i_after + wl_j_after
-
-                    if wl_after < wl_before * 0.99:  # at least 1% improvement
-                        # Check overlap at new positions
-                        overlap_i = False
-                        overlap_j = False
-                        for k in range(N):
-                            if k == i or k == j:
-                                continue
-                            if _check_overlap_pair(
-                                (positions[i, 0].item(), positions[i, 1].item()),
-                                widths[i].item(), heights[i].item(),
-                                (positions[k, 0].item(), positions[k, 1].item()),
-                                widths[k].item(), heights[k].item(),
-                            ):
-                                overlap_i = True
-                                break
-                            if _check_overlap_pair(
-                                (positions[j, 0].item(), positions[j, 1].item()),
-                                widths[j].item(), heights[j].item(),
-                                (positions[k, 0].item(), positions[k, 1].item()),
-                                widths[k].item(), heights[k].item(),
-                            ):
-                                overlap_j = True
-                                break
-
-                        if not overlap_i and not overlap_j:
-                            swaps_this_pass += 1
+                        if wl_after < wl_before * 0.99:
+                            # Fast overlap check using spatial hash
+                            if not check_overlap_fast(i) and not check_overlap_fast(j):
+                                swaps_this_pass += 1
+                            else:
+                                positions[i] = pos_i
+                                positions[j] = pos_j
                         else:
-                            # Revert swap
                             positions[i] = pos_i
                             positions[j] = pos_j
-                    else:
-                        # Revert swap
-                        positions[i] = pos_i
-                        positions[j] = pos_j
 
         total_swaps += swaps_this_pass
         if swaps_this_pass == 0:

@@ -54,8 +54,9 @@ def solve(
         repair_iterations = config.get("repair_iterations", repair_iterations)
 
     cell_features = cell_features.clone()
-    initial_cell_features = cell_features.clone()
     N = cell_features.shape[0]
+
+    initial_cell_features = cell_features.clone()
 
     # Adaptive epoch scaling: fewer epochs for larger designs
     # (legalization handles remaining overlaps)
@@ -187,3 +188,49 @@ def solve(
             "repair_after": repair_after,
         },
     }
+
+
+def solve_multistart(cell_features, pin_features, edge_list, config=None, verbose=False):
+    """Run solver with multiple initial placements, pick best WL.
+
+    Tries: original positions (from test.py init) + spectral placement.
+    Returns the result with lowest WL (that has 0 overlap).
+    """
+    from placement import calculate_normalized_metrics
+
+    N = cell_features.shape[0]
+    best_result = None
+    best_wl = float("inf")
+
+    inits = [("original", cell_features.clone())]
+
+    # Add spectral init for small/medium designs
+    if N <= 5000:
+        from ashvin.init_placement import spectral_placement
+        spectral_cf = cell_features.clone()
+        spectral_placement(spectral_cf, pin_features, edge_list)
+        inits.append(("spectral", spectral_cf))
+
+    for name, cf in inits:
+        if verbose:
+            print(f"  Multi-start: trying {name} init...")
+
+        # Suppress WL polish config to keep it fast, re-enable for best
+        fast_config = dict(config) if config else {}
+        fast_config["_skip_wl_polish"] = True
+
+        result = solve(cf, pin_features, edge_list, config=fast_config, verbose=False)
+        m = calculate_normalized_metrics(result["final_cell_features"], pin_features, edge_list)
+
+        if verbose:
+            print(f"    {name}: overlap={m['overlap_ratio']:.4f} wl={m['normalized_wl']:.4f}")
+
+        if m["overlap_ratio"] == 0 and m["normalized_wl"] < best_wl:
+            best_wl = m["normalized_wl"]
+            best_result = result
+
+    # If no zero-overlap result, fall back to original
+    if best_result is None:
+        best_result = solve(cell_features, pin_features, edge_list, config=config, verbose=verbose)
+
+    return best_result
