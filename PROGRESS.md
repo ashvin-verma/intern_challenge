@@ -213,10 +213,27 @@ This creates N×N tensors for dx, dy, min_sep_x, min_sep_y, overlap_x, overlap_y
 
 **Run 13 notes:** GD polish + cell swaps. WL 0.5132→0.4912.
 
-**Run 14 (optuna): 30 trials on tests 1,4,7,8. Best WL: 0.4544 (all tests). 0.0000 overlap.**
-Best config: lr=0.003, lambda_wl=1.16, lambda_overlap 13→139, beta 0.71→2.09, 500 epochs, warmup LR.
-Key insight: softer beta (2.09 vs 6.0) + lower LR + fewer epochs beats our aggressive defaults.
-Saved: `ashvin/results/best_config.json`
+**Run 14 (optuna v1): 30 trials. Best WL: 0.4544.**
+
+**Run 15 (optuna v3): 100 trials on tests 1,3,5,7,9. Best WL: 0.4091 on all tests.**
+Best config: lr=0.003, lambda_wl=3.58, lambda_overlap 1.2→96, beta 0.11→2.03, 500 epochs, warmup_cosine.
+Key insight: higher lambda_wl (3.58) + warmup_cosine LR + low overlap start (1.2).
+
+**Run 16 (multi-start): spectral + random init, pick best. WL: 0.4468.** Spectral helps on some tests (3,5,9) but hurts on others.
+
+**Run 17 (barycentric): move cells toward neighbor centroids post-legalization. WL: 0.4538.** Modest help, most moves rejected due to overlap.
+
+**Run 18 (explosive scatter): scatter all positions 1.3-2.0× from centroid, reconverge.** Doesn't help — disrupted solutions don't find better minima.
+
+**Run 19 (targeted scatter): identify top 20% highest-WL edges, move those cells toward neighbor centroids, short re-solve. WL: 0.4015.** Big win! Breaks local WL minima.
+
+**Run 20 (multi-scatter, 3 iterations): WL: 0.3842.** Each iteration finds new hot cells. Best result yet.
+
+**Run 21 (nuclear/SEMF loss): Lennard-Jones and SEMF-inspired potentials. WL: 0.4453.** Negligible impact — redundant with existing WL loss. The attraction term doesn't add information beyond what wirelength_attraction_loss already provides.
+
+**Current best config:** `ashvin/results/best_config.json` + 3 scatter iterations.
+| 15  | Optuna v3 (100 trials) | 0.0000 | 0.4091 | ~45s | 1-10 |
+| 20  | + multi-scatter (3 iters) | 0.0000 | **0.3842** | ~90s | 1-9 |
 | —   | Old leaderboard #1 | 0.0000 | 0.1310 | 11.32s | 1-10 |
 
 **Run 6 notes:** Added config-driven solver with cosine LR + lambda ramping. Cosine LR slightly hurt vs constant. Infrastructure ready for optuna.

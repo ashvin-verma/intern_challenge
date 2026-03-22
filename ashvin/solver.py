@@ -107,15 +107,24 @@ def solve(
         # Ramped lambda_overlap
         lam_ov = lambda_overlap_start + (lambda_overlap_end - lambda_overlap_start) * progress
 
+        # Check if nuclear loss is enabled
+        use_nuclear = config.get("lambda_nuclear", 0.0) if config else 0.0
+
         t0 = time.perf_counter()
         wl_loss = wirelength_attraction_loss(cell_features_current, pin_features, edge_list)
         t1 = time.perf_counter()
         ov_loss = scalable_overlap_loss(cell_features_current, beta=beta)
         t2 = time.perf_counter()
         d_loss = density_loss(cell_features_current) if lambda_density > 0 else torch.tensor(0.0)
+
+        if use_nuclear > 0:
+            from ashvin.nuclear_loss import nuclear_loss
+            n_loss = nuclear_loss(cell_features_current, pin_features, edge_list, alpha=use_nuclear)
+        else:
+            n_loss = torch.tensor(0.0)
         t3 = time.perf_counter()
 
-        total_loss = lambda_wl * wl_loss + lam_ov * ov_loss + lambda_density * d_loss
+        total_loss = lambda_wl * wl_loss + lam_ov * ov_loss + lambda_density * d_loss + n_loss
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_([pos], max_norm=5.0)
         t4 = time.perf_counter()
@@ -166,14 +175,17 @@ def solve(
     from ashvin.wl_optimize import barycentric_refinement
     bary_stats = barycentric_refinement(cell_features, pin_features, edge_list)
 
-    # Targeted scatter: move hot-WL cells toward neighbors, re-solve
+    # Iterative targeted scatter: repeatedly fix high-WL clusters
     skip_scatter = config.get("_skip_scatter", False) if config else False
+    max_scatters = config.get("max_scatters", 3) if config else 3
     if not skip_scatter and N <= 5000:
         from ashvin.wl_optimize import targeted_scatter_reconverge
-        scatter_result = targeted_scatter_reconverge(
-            cell_features, pin_features, edge_list, config=config
-        )
-        if scatter_result is not None:
+        for _sc in range(max_scatters):
+            scatter_result = targeted_scatter_reconverge(
+                cell_features, pin_features, edge_list, config=config
+            )
+            if scatter_result is None:
+                break  # no improvement found
             cell_features[:] = scatter_result["final_cell_features"]
 
     train_end = time.perf_counter()
