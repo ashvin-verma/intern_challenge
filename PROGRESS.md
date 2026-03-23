@@ -394,9 +394,37 @@ LR schedule controls coarse→fine transition.
 4. Then iterate with local swaps
 Fast (O(N * degree)), starts legal, no legalization shock.
 
+### Step 3a: Full Constructive Pipeline — TESTED, DOESN'T HELP
+Islands → coarse GD (800 epochs, high overlap penalty) → uncluster → legalize → polish → swaps.
+Result: worse than GD pipeline on ALL tests (0.36-0.49 vs 0.30-0.43).
+Root cause: coarse GD can't spread islands apart — they're massive overlapping blocks
+(visible in plots at `ashvin/plots/constructive/`). Overlap still 76-100% after 800 epochs.
+The overlap loss isn't calibrated for island-sized objects.
+
+### Step 3b: Island-clustered INIT for existing GD pipeline
+Instead of replacing GD, use island clustering to create better INITIAL positions:
+1. Form islands (connected cell clusters)
+2. Pack internally (single-row blocks)
+3. Coarse-place islands (spread apart)
+4. Uncluster → use as init for existing GD pipeline (replaces random init)
+
+This combines the connectivity-aware clustering with the proven GD optimizer.
+
+### Step 3b Results (multistart with island init):
+| Test | Orig | Best | Improve | Winner |
+|------|------|------|---------|--------|
+| 1 | 0.412 | **0.400** | +2.9% | island_init |
+| 2 | 0.353 | **0.313** | +11.4% | island_init |
+| 3 | 0.417 | **0.311** | +25.3% | spectral |
+| 4 | 0.435 | **0.431** | +0.8% | greedy |
+| 5 | 0.407 | **0.401** | +1.6% | greedy |
+
+Island init beats random init AND spectral on tests 1-2. Spectral still best on test 3.
+Greedy (random init) still best on tests 4-5. No single strategy dominates.
+
 ### Combined Architecture
-`Constructive init (island clustering) → optional GD polish → swap engine`
-Each phase builds on the previous. No single phase has to do all the work.
+`Multistart (island_init + greedy + spectral) → GD pipeline (inflate+anchor) → swap engine`
+Each init strategy feeds into the same GD pipeline. Best result kept per test.
 
 **Plots:** `ashvin/plots/run24_multistart/`, `ashvin/plots/legalize_compare/`
 

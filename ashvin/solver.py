@@ -403,8 +403,12 @@ def solve_multistart(cell_features, pin_features, edge_list, config=None, verbos
 
     strategies = [("greedy_legal", cell_features.clone(), {})]
 
-    # WL-priority legalization variant
-    strategies.append(("wl_priority", cell_features.clone(), {"_use_wl_legalize": True}))
+    # Island-clustered init
+    if N <= 5000:
+        from ashvin.constructive import island_init
+        island_cf = cell_features.clone()
+        island_init(island_cf, pin_features, edge_list, config=config, verbose=verbose)
+        strategies.append(("island_init", island_cf, {}))
 
     # Add spectral init for small/medium designs
     if N <= 5000:
