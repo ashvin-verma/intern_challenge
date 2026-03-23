@@ -58,6 +58,14 @@ def solve(
 
     initial_cell_features = cell_features.clone()
 
+    # Cell inflation: inflate widths/heights during GD so cells spread further apart.
+    # When deflated back before legalization, cells have natural gaps between them,
+    # so legalization only needs minor adjustments instead of major reshuffling.
+    inflate = config.get("inflate", 1.08) if config else 1.08
+    if inflate > 1.0:
+        cell_features[:, 4] *= inflate  # width
+        cell_features[:, 5] *= inflate  # height
+
     # Adaptive epoch scaling: fewer epochs for larger designs
     # (legalization handles remaining overlaps)
     if epochs == 2000:  # only auto-scale if using default
@@ -148,34 +156,16 @@ def solve(
 
     cell_features[:, 2:4] = pos.detach()
 
+    # Deflate back to true sizes before legalization
+    if inflate > 1.0:
+        cell_features[:, 4] = initial_cell_features[:, 4]
+        cell_features[:, 5] = initial_cell_features[:, 5]
+
     # === MULTI-PASS PIPELINE (compiler-style) ===
-    from ashvin.net_legalize import net_aware_legalize
     from ashvin.legalize import legalize as legalize_fallback
     from ashvin.wl_optimize import barycentric_refinement, targeted_scatter_reconverge
 
-    def legalize_best(cf, pf=None, el=None):
-        """Row-pack first (reliable), then net-aware refinement (WL improvement)."""
-        pf = pf or pin_features
-        el = el or edge_list
-        # Step 1: reliable row-packing to guarantee zero overlap
-        stats = legalize_fallback(cf, pin_features=pf, edge_list=el)
-        # Step 2: net-aware refinement — try to improve WL by reassigning slots
-        from placement import calculate_normalized_metrics
-        wl_before = calculate_normalized_metrics(cf, pf, el)["normalized_wl"]
-        cf_backup = cf.clone()
-        try:
-            net_aware_legalize(cf, pf, el, alpha=0.1, beta=5.0)
-            repair_overlaps(cf, max_iterations=100)
-            wl_after = calculate_normalized_metrics(cf, pf, el)["normalized_wl"]
-            overlap_after = calculate_normalized_metrics(cf, pf, el)["overlap_ratio"]
-            if overlap_after > 0 or wl_after >= wl_before:
-                cf[:] = cf_backup  # revert if worse or has overlap
-        except Exception:
-            cf[:] = cf_backup
-        return stats
-
     skip_scatter = config.get("_skip_scatter", False) if config else False
-    max_scatters = config.get("max_scatters", 3) if config else 3
     num_macros_det = (cell_features[:, 5] > 1.5).sum().item()
 
     legalize_time = 0.0
@@ -185,7 +175,7 @@ def solve(
 
     # Phase 1: Initial legalization (guarantee zero overlap)
     for leg_pass in range(5):
-        leg_stats = legalize_best(cell_features)
+        leg_stats = legalize_fallback(cell_features, pin_features=pin_features, edge_list=edge_list)
         legalize_time += leg_stats["time"]
         rep_stats = repair_overlaps(cell_features, max_iterations=repair_iterations)
         repair_time += rep_stats["time"]
@@ -195,12 +185,18 @@ def solve(
         if repair_after == 0:
             break
 
-    # Phase 2: Fixed-point WL optimization loop
+    # Phase 2: Anchor-based WL optimization loop
+    # Key insight: after legalization, store positions as anchors.
+    # GD optimizes WL but is tethered to the legal state via anchor loss.
+    # Next legalization only needs small corrections.
     from placement import calculate_normalized_metrics
     best_wl = calculate_normalized_metrics(cell_features, pin_features, edge_list)["normalized_wl"]
     best_features = cell_features.clone()
 
     pipeline_passes = config.get("pipeline_passes", 3) if config else 3
+    lambda_anchor = config.get("lambda_anchor", 0.1) if config else 0.1
+    anchor_gd_steps = config.get("anchor_gd_steps", 80) if config else 80
+
     for pipe_iter in range(pipeline_passes):
         improved_this_iter = False
 
@@ -215,25 +211,33 @@ def solve(
             if scatter_result is not None:
                 cell_features[:] = scatter_result["final_cell_features"]
 
-        # Pass C: Short GD on WL only + re-legalize
+        # Pass C: Anchor-tethered GD — optimize WL while staying near legal positions
+        # Store current legal positions as anchors
+        anchor_pos = cell_features[:, 2:4].detach().clone()
+
         std_pos = cell_features[num_macros_det:, 2:4].clone().detach()
         std_pos.requires_grad_(True)
         macro_pos = cell_features[:num_macros_det, 2:4].detach()
+        anchor_std = anchor_pos[num_macros_det:]
+
         opt_wl = optim.Adam([std_pos], lr=0.003)
-        for _ep in range(100):
+        for _ep in range(anchor_gd_steps):
             opt_wl.zero_grad()
             full_pos = torch.cat([macro_pos, std_pos], dim=0)
             cf_tmp = cell_features.clone()
             cf_tmp[:, 2:4] = full_pos
             wl_l = wirelength_attraction_loss(cf_tmp, pin_features, edge_list)
-            wl_l.backward()
+            # Anchor loss: soft spring to legal positions
+            anc_l = ((std_pos - anchor_std) ** 2).mean()
+            total = lambda_wl * wl_l + lambda_anchor * anc_l
+            total.backward()
             torch.nn.utils.clip_grad_norm_([std_pos], max_norm=1.0)
             opt_wl.step()
         cell_features[:, 2:4] = torch.cat([macro_pos, std_pos.detach()], dim=0)
 
-        # Pass D: Re-legalize
+        # Pass D: Re-legalize (should be small corrections thanks to anchor)
         for _lp in range(3):
-            legalize_best(cell_features)
+            legalize_fallback(cell_features, pin_features=pin_features, edge_list=edge_list)
             rep = repair_overlaps(cell_features, max_iterations=100)
             if rep["overlaps_after"] == 0:
                 break
@@ -251,7 +255,7 @@ def solve(
 
     cell_features[:] = best_features
 
-    # Phase 3: Detailed placement (swaps + reinsertion)
+    # Phase 3: Detailed placement (swaps + reinsertion) — small designs only
     skip_detailed = config.get("_skip_detailed", False) if config else False
     if not skip_detailed and N <= 300:
         from ashvin.detailed import detailed_placement
@@ -264,6 +268,40 @@ def solve(
         m_post = calculate_normalized_metrics(cell_features, pin_features, edge_list)
         if m_post["overlap_ratio"] > 0 or m_post["normalized_wl"] >= wl_pre_dp:
             cell_features[:] = cf_backup  # revert if worse
+
+    # Phase 4: Global swap — long-range WL optimization (all sizes)
+    skip_global_swap = config.get("_skip_global_swap", False) if config else False
+    if not skip_global_swap:
+        from ashvin.global_swap import global_swap, edge_targeted_swap
+        from placement import calculate_normalized_metrics
+        wl_pre_gs = calculate_normalized_metrics(cell_features, pin_features, edge_list)["normalized_wl"]
+        cf_backup = cell_features.clone()
+
+        # Pass 1: Edge-targeted swap (attack worst edges directly)
+        gs_top_frac = config.get("gs_top_frac", 0.5) if config else 0.5
+        gs_passes = config.get("gs_passes", 5) if config else 5
+        gs_search_radius = config.get("gs_search_radius", 3) if config else 3
+
+        et_stats = edge_targeted_swap(
+            cell_features, pin_features, edge_list,
+            num_passes=gs_passes, top_edge_frac=0.2, verbose=verbose,
+        )
+
+        # Pass 2: Global swap (barycentric target search)
+        gs_stats = global_swap(
+            cell_features, pin_features, edge_list,
+            num_passes=gs_passes, top_frac=gs_top_frac,
+            search_radius=gs_search_radius, verbose=verbose,
+        )
+
+        # Verify legality
+        rep_gs = repair_overlaps(cell_features, max_iterations=50)
+        m_gs = calculate_normalized_metrics(cell_features, pin_features, edge_list)
+        if m_gs["overlap_ratio"] > 0 or m_gs["normalized_wl"] >= wl_pre_gs:
+            cell_features[:] = cf_backup  # revert if worse
+        elif verbose:
+            print(f"  Global swap: {et_stats['swaps']}+{gs_stats['swaps']} swaps, "
+                  f"WL {wl_pre_gs:.4f} -> {m_gs['normalized_wl']:.4f}")
 
     train_end = time.perf_counter()
 
@@ -348,9 +386,9 @@ def solve_scatter(cell_features, pin_features, edge_list, config=None, verbose=F
 
 
 def solve_multistart(cell_features, pin_features, edge_list, config=None, verbose=False):
-    """Run solver with multiple initial placements, pick best WL.
+    """Run solver with multiple strategies, pick best WL.
 
-    Tries: original positions (from test.py init) + spectral placement.
+    Tries: original positions + spectral placement + WL-priority legalization.
     Returns the result with lowest WL (that has 0 overlap).
     """
     from placement import calculate_normalized_metrics
@@ -359,24 +397,26 @@ def solve_multistart(cell_features, pin_features, edge_list, config=None, verbos
     best_result = None
     best_wl = float("inf")
 
-    inits = [("original", cell_features.clone())]
+    strategies = [("greedy_legal", cell_features.clone(), {})]
+
+    # WL-priority legalization variant
+    strategies.append(("wl_priority", cell_features.clone(), {"_use_wl_legalize": True}))
 
     # Add spectral init for small/medium designs
     if N <= 5000:
         from ashvin.init_placement import spectral_placement
         spectral_cf = cell_features.clone()
         spectral_placement(spectral_cf, pin_features, edge_list)
-        inits.append(("spectral", spectral_cf))
+        strategies.append(("spectral", spectral_cf, {}))
 
-    for name, cf in inits:
+    for name, cf, extra_config in strategies:
         if verbose:
-            print(f"  Multi-start: trying {name} init...")
+            print(f"  Multi-start: trying {name}...")
 
-        # Suppress WL polish config to keep it fast, re-enable for best
-        fast_config = dict(config) if config else {}
-        fast_config["_skip_wl_polish"] = True
+        run_config = dict(config) if config else {}
+        run_config.update(extra_config)
 
-        result = solve(cf, pin_features, edge_list, config=fast_config, verbose=False)
+        result = solve(cf, pin_features, edge_list, config=run_config, verbose=False)
         m = calculate_normalized_metrics(result["final_cell_features"], pin_features, edge_list)
 
         if verbose:
@@ -386,7 +426,6 @@ def solve_multistart(cell_features, pin_features, edge_list, config=None, verbos
             best_wl = m["normalized_wl"]
             best_result = result
 
-    # If no zero-overlap result, fall back to original
     if best_result is None:
         best_result = solve(cell_features, pin_features, edge_list, config=config, verbose=verbose)
 

@@ -242,6 +242,94 @@ Best per-test: test 7=0.3059, test 10=0.2292. Detailed swaps help small/medium t
 
 **Current best avg WL: 0.3540 (tests 1-10), 0.0000 overlap. Rank ~9.**
 
+**Run 24 (multistart + WL-priority legalization): WL improvement on tests 1-4.**
+New strategies added:
+1. **WL-priority legalization** (`ashvin/wl_legalize.py`): Places cells in WL-priority order (worst-WL first) at barycentric-optimal positions. Beats greedy row-packing on some tests by 12%.
+2. **Row reordering** (`ashvin/global_swap.py`): Reorders cells within rows + cross-row reinsertion. Always-legal by construction (compaction after each swap).
+3. **SA refinement** (`ashvin/sa_refine.py`): Simulated annealing with Metropolis criterion on legal moves. Small improvement (~0.1%).
+4. **Multistart** via `solve_multistart()`: Tries 3 strategies (greedy, wl_priority, spectral) and keeps best. Different strategies win on different tests.
+
+Per-test results (multistart for 1-3, greedy for 4-9):
+| Test | N | Old WL | New WL | Change | Strategy |
+|------|---|--------|--------|--------|----------|
+| 1 | 22 | 0.4124 | 0.3957 | -4.1% | multistart (greedy won) |
+| 2 | 28 | 0.3529 | 0.3118 | -11.6% | multistart (wl_priority won) |
+| 3 | 32 | 0.4166 | 0.3413 | -18.1% | multistart (spectral won) |
+| 4 | 53 | 0.4350 | 0.4331 | -0.4% | multistart (greedy won) |
+| 5 | 79 | 0.4070 | 0.4039 | -0.8% | greedy + row reorder |
+| 6 | 105 | 0.3275 | 0.3223 | -1.6% | greedy + row reorder |
+| 7 | 155 | 0.3059 | 0.3050 | -0.3% | greedy + row reorder |
+| 8 | 157 | 0.3283 | 0.3288 | +0.1% | greedy + row reorder |
+| 9 | 208 | 0.3255 | 0.3215 | -1.2% | greedy + row reorder |
+
+**Key insights:**
+- No single strategy wins all tests. Multistart (greedy + wl_priority + spectral) guarantees we never do worse.
+- Biggest wins on tests 1-3 (4-18%) from multistart, noise-level improvements on tests 5-9 from row reordering alone.
+- WL-priority legalization places cells in WL-contribution order at barycentric-optimal positions — 12% better than greedy on test 2.
+- Spectral init is 18% better on test 3 — the best single improvement.
+
+**Run 24b (optuna v2, 80 trials on tests 1-3):**
+Best trial 54: score 0.3739 (avg WL on tests 1-3, down from 0.3823 baseline = 2.2% improvement)
+Full eval on tests 1-9: **avg WL = 0.3593** (down from 0.3679 = 2.3% improvement).
+Best config saved: `ashvin/results/best_config_v2.json`
+Key config changes vs old:
+- lambda_wl: 3.58 → **7.51** (doubled! WL matters more)
+- lr: 0.003 → **0.001** (lower, more stable)
+- warmup_epochs: 200 → **50** (shorter warmup)
+- beta_start: 0.11 → **0.43** (start sharper)
+- pipeline_passes: 3 → **5** (more refinement)
+- lambda_overlap_end: 96.2 → **140.2** (higher final overlap penalty)
+
+Intuition: higher lambda_wl forces optimizer to prioritize WL harder. Lower LR prevents overshooting. More pipeline passes = more legalize-refine cycles.
+
+**Run 24c (multistart + v2 config, tests 1-5):**
+| Test | N | Old WL | New WL | Change |
+|------|---|--------|--------|--------|
+| 1 | 22 | 0.4124 | **0.3813** | -7.6% |
+| 2 | 28 | 0.3529 | **0.3187** | -9.7% |
+| 3 | 32 | 0.4166 | **0.3335** | -19.9% |
+| 4 | 53 | 0.4350 | **0.4321** | -0.7% |
+| 5-10 | | (not yet run with multistart + v2) | | |
+
+**Estimated avg WL (tests 1-10): ~0.338** using v2+multistart for tests 1-4, old numbers for 5-10.
+Still rank ~9 on old leaderboard. Need 22% more to reach #2 (0.263), 61% more for #1 (0.131).
+
+**Run 25 (cell inflation + anchor loss): All tests improved!**
+Two structural changes addressing root cause (GD→legalization WL damage):
+1. **Cell inflation** (8%): inflate cell widths/heights during GD so overlap penalty spreads cells further apart. Deflate before legalization → cells have natural gaps → legalization needs minor corrections only.
+2. **Anchor loss**: after legalization, GD refinement is tethered to legal positions via `lambda_anchor * ||pos - anchor||^2`. Prevents cells from drifting far from legal state. Next legalization only needs small corrections.
+
+| Test | N | Old WL | New WL | Change |
+|------|---|--------|--------|--------|
+| 1 | 22 | 0.4124 | **0.3868** | -6.2% |
+| 2 | 28 | 0.3529 | **0.3376** | -4.3% |
+| 3 | 32 | 0.4166 | **0.3953** | -5.1% |
+| 4 | 53 | 0.4350 | **0.4305** | -1.0% |
+| 5 | 79 | 0.4070 | **0.4000** | -1.7% |
+| 6 | 105 | 0.3275 | **0.3203** | -2.2% |
+| 7 | 155 | 0.3059 | **0.3021** | -1.2% |
+| 8 | 157 | 0.3283 | **0.3250** | -1.0% |
+| 9 | 208 | 0.3255 | **0.3240** | -0.4% |
+| **AVG** | | **0.3679** | **0.3580** | **-2.7%** |
+
+With multistart, test 3 reaches **0.3237** (22.3% better, spectral init + inflation + anchor).
+
+**Run 25b (topology-preserving legalization): Mixed.**
+Changed legalization to re-center compacted rows at GD centroid instead of always pushing rightward.
+Small improvement on tests 1,2,5 (+0.001-0.003), slight regression on tests 3,4 (-0.002-0.003).
+The re-centering helps but isn't a game-changer — the cursor-push issue was less severe than expected.
+
+**Current best approach:** Cell inflation (8%) + anchor loss (0.1) + v2 optuna config + multistart (spectral for test 3).
+
+**Estimated avg WL (tests 1-9): ~0.358** (single strategy), ~0.34 with multistart.
+**Plots:** `ashvin/plots/run24_multistart/`
+
+**What didn't work (new):**
+- Position-based cell swaps (global swap): Cells have different widths (1.0-3.0) in packed rows. Swapping positions always creates overlap. Fixed by switching to row-based reordering.
+- Graduated row snapping (sin²(πy) penalty during GD): Actually hurt WL by fighting the WL optimization.
+- SA refinement: Tiny improvement (<0.1%) because within-row swaps have limited improvement potential after row reordering.
+- Row reordering on tests 5-9: 0-1.6% improvement — noise level.
+
 **What's stopping #1 (0.13 WL):**
 - Legalization adds 0.05-0.15 WL penalty per application (row packing is connectivity-blind)
 - GD gets positions to ~0.25 WL but legalization bumps to ~0.35+

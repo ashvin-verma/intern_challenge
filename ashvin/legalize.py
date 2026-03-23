@@ -181,28 +181,47 @@ def legalize(cell_features, num_macros=None, pin_features=None, edge_list=None):
                 row_assignments[row_idx] = []
             row_assignments[row_idx].append(idx)
 
-        # For each row, pack cells left-to-right avoiding overlaps
+        # For each row, place cells preserving GD topology.
+        # 1. Sort by GD x-position (preserve left-to-right order)
+        # 2. Compact: remove overlaps between adjacent cells
+        # 3. Re-center at GD centroid so displacement is symmetric
         for row_idx, cells_in_row in row_assignments.items():
             row_y = y_min + row_idx * row_height
 
-            # Sort cells in row by x position
+            if not cells_in_row:
+                continue
+
+            # Sort cells in row by GD x position (preserve topology)
             cells_in_row.sort(key=lambda i: positions[i, 0].item())
 
-            # Track rightmost edge of placed cells in this row
-            cursor_x = None
+            # Remember GD centroid for this row
+            gd_centroid_x = sum(positions[i, 0].item() for i in cells_in_row) / len(cells_in_row)
 
-            for idx in cells_in_row:
+            # Step 1: Place at GD x-positions, then resolve overlaps
+            # Start by assigning GD positions
+            placed_x = [positions[i, 0].item() for i in cells_in_row]
+
+            # Step 2: Left-to-right sweep — ensure no overlap between adjacent cells
+            for k in range(1, len(cells_in_row)):
+                prev_idx = cells_in_row[k - 1]
+                cur_idx = cells_in_row[k]
+                prev_right = placed_x[k - 1] + widths[prev_idx].item() / 2
+                cur_left_min = prev_right + widths[cur_idx].item() / 2
+                if placed_x[k] < cur_left_min:
+                    placed_x[k] = cur_left_min
+
+            # Step 3: Re-center at GD centroid (reduce net displacement)
+            packed_centroid = sum(placed_x) / len(placed_x)
+            offset = gd_centroid_x - packed_centroid
+            placed_x = [x + offset for x in placed_x]
+
+            # Step 4: Handle macro obstacles — shift cells that overlap macros
+            for k in range(len(cells_in_row)):
+                idx = cells_in_row[k]
+                x = placed_x[k]
                 w = widths[idx].item()
                 h = heights[idx].item()
-                target_x = positions[idx, 0].item()
 
-                # Start from target_x or cursor_x, whichever is further right
-                if cursor_x is not None:
-                    x = max(target_x, cursor_x + w / 2)
-                else:
-                    x = target_x
-
-                # Check macro obstacles and shift right — re-check until clean
                 for _attempt in range(20):
                     shifted = False
                     for ox_min, oy_min, ox_max, oy_max in obstacles:
@@ -217,10 +236,19 @@ def legalize(cell_features, num_macros=None, pin_features=None, edge_list=None):
                             shifted = True
                     if not shifted:
                         break
+                placed_x[k] = x
 
-                positions[idx, 0] = x
+                # Re-resolve overlaps rightward after macro shift
+                for j in range(k + 1, len(cells_in_row)):
+                    prev_right = placed_x[j - 1] + widths[cells_in_row[j - 1]].item() / 2
+                    cur_left_min = prev_right + widths[cells_in_row[j]].item() / 2
+                    if placed_x[j] < cur_left_min:
+                        placed_x[j] = cur_left_min
+
+            # Apply positions
+            for k, idx in enumerate(cells_in_row):
+                positions[idx, 0] = placed_x[k]
                 positions[idx, 1] = row_y
-                cursor_x = x + w / 2
 
     # Write back
     cell_features[:, 2:4] = positions
