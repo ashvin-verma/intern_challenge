@@ -365,13 +365,12 @@ Result: -0.2% to -4.8% on all tests. Mid-training legalization disrupts Adam mom
 The current pipeline (full GD → legalize → anchored-GD-polish × 5) is already the right structure.
 **Conclusion:** Interleaving at the GD level doesn't help. The bottleneck is elsewhere.
 
-### Step 2: Legalization-Aware GD
-Add differentiable "row penalty" to GD loss:
-- Cells want to be at integer y-values (row centers)
-- Cells want to not overlap their x-neighbors in the same row
-GD produces output that's *almost* legal, so legalization barely needs to touch it.
-Different from the failed row-snapping attempt (sin²πy) — this needs to be integrated
-into the main GD loop from the start, not bolted on at the end.
+### Step 2: Legalization-Aware GD — TESTED, DOESN'T HELP
+Added sin²(πy) row penalty ramped over last 60% of GD epochs (integrated, not bolted on).
+Result: same pattern as everything else — T2 +6.1%, T1 -5%, T3 -1.9%, T4-5 flat.
+The row penalty helps Abacus win on T2 (row-aligned GD → better displacement preservation)
+but constrains GD exploration on other tests.
+**Conclusion:** GD→legalize architecture has a fundamental ceiling ~0.35-0.36. Need Step 3.
 
 ### Step 3: Constructive Placement — Island Clustering (user's idea)
 Build placement bottom-up via multi-level clustering:
