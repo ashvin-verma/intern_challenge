@@ -319,9 +319,37 @@ Changed legalization to re-center compacted rows at GD centroid instead of alway
 Small improvement on tests 1,2,5 (+0.001-0.003), slight regression on tests 3,4 (-0.002-0.003).
 The re-centering helps but isn't a game-changer — the cursor-push issue was less severe than expected.
 
-**Current best approach:** Cell inflation (8%) + anchor loss (0.1) + v2 optuna config + multistart (spectral for test 3).
+**Run 26 (swap engine): Iterative within-row swaps + cross-row reinsertion.**
+New engine (`ashvin/swap_engine.py`) runs up to 20 iterations of targeted cell moves after legalization.
+Each move is O(degree) to evaluate. Two move types:
+- Within-row swap: exchange cell ordering, recompact (always legal)
+- Cross-row reinsertion: remove from source row, insert near barycentric target in dest row
 
-**Estimated avg WL (tests 1-9): ~0.358** (single strategy), ~0.34 with multistart.
+First test on test 1: **0.3868 → 0.3700** (+4.3%). The cross-row reinsertion is effective — 20 moves per iteration.
+Tests 2-3: minimal improvement (0-6 swaps found). The pipeline already handles these well.
+
+Note: topology-preserving legalization (re-centering rows at GD centroid) caused REGRESSION on most tests.
+Reverted to original left-to-right packing. The original legalization is already topology-preserving
+(cells sorted by x within each row). The issue is the cursor push, which inflation partially addresses.
+
+Full suite results (detailed + swap engine):
+| Test | N | Orig | Prev | New | vs Prev |
+|------|---|------|------|-----|---------|
+| 1 | 22 | 0.412 | 0.387 | **0.369** | **+1.8%** |
+| 2 | 28 | 0.353 | 0.338 | 0.347 | -1.0% |
+| 3 | 32 | 0.417 | 0.395 | 0.402 | -0.7% |
+| 4 | 53 | 0.435 | 0.431 | 0.432 | -0.1% |
+| 5 | 79 | 0.407 | 0.400 | 0.401 | -0.1% |
+| 6 | 105 | 0.328 | 0.320 | 0.321 | -0.1% |
+| 7 | 155 | 0.306 | 0.302 | 0.305 | -0.3% |
+| 8 | 157 | 0.328 | 0.325 | **0.322** | **+0.4%** |
+| 9 | 208 | 0.326 | 0.324 | 0.330 | -0.6% |
+| **AVG** | | **0.368** | **0.358** | **0.359** | **-0.1%** |
+
+Cross-row reinsertion helps test 1 (+4.8%) and test 8 (+1.0%). Within-row swaps cause slight regressions elsewhere.
+The swap engine currently evaluates only swapped/moved cells' WL, not displaced neighbors — needs fixing for within-row.
+
+**Current best approach:** Cell inflation (8%) + anchor loss (0.1) + v2 optuna config + detailed + swap engine + multistart.
 **Plots:** `ashvin/plots/run24_multistart/`
 
 **What didn't work (new):**

@@ -263,45 +263,33 @@ def solve(
         wl_pre_dp = calculate_normalized_metrics(cell_features, pin_features, edge_list)["normalized_wl"]
         cf_backup = cell_features.clone()
         dp_stats = detailed_placement(cell_features, pin_features, edge_list)
-        # Verify legality + improvement
         rep_final = repair_overlaps(cell_features, max_iterations=50)
         m_post = calculate_normalized_metrics(cell_features, pin_features, edge_list)
         if m_post["overlap_ratio"] > 0 or m_post["normalized_wl"] >= wl_pre_dp:
-            cell_features[:] = cf_backup  # revert if worse
+            cell_features[:] = cf_backup
 
-    # Phase 4: Global swap — long-range WL optimization (all sizes)
-    skip_global_swap = config.get("_skip_global_swap", False) if config else False
-    if not skip_global_swap:
-        from ashvin.global_swap import global_swap, edge_targeted_swap
+    # Phase 4: Iterative swap engine — within-row + cross-row moves
+    skip_swaps = config.get("_skip_swaps", False) if config else False
+    swap_iters = config.get("swap_iterations", 20) if config else 20
+    if not skip_swaps:
+        from ashvin.swap_engine import swap_engine
         from placement import calculate_normalized_metrics
-        wl_pre_gs = calculate_normalized_metrics(cell_features, pin_features, edge_list)["normalized_wl"]
+        wl_pre_swap = calculate_normalized_metrics(cell_features, pin_features, edge_list)["normalized_wl"]
         cf_backup = cell_features.clone()
 
-        # Pass 1: Edge-targeted swap (attack worst edges directly)
-        gs_top_frac = config.get("gs_top_frac", 0.5) if config else 0.5
-        gs_passes = config.get("gs_passes", 5) if config else 5
-        gs_search_radius = config.get("gs_search_radius", 3) if config else 3
-
-        et_stats = edge_targeted_swap(
+        se_stats = swap_engine(
             cell_features, pin_features, edge_list,
-            num_passes=gs_passes, top_edge_frac=0.2, verbose=verbose,
-        )
-
-        # Pass 2: Global swap (barycentric target search)
-        gs_stats = global_swap(
-            cell_features, pin_features, edge_list,
-            num_passes=gs_passes, top_frac=gs_top_frac,
-            search_radius=gs_search_radius, verbose=verbose,
+            max_iterations=swap_iters, verbose=verbose,
         )
 
         # Verify legality
-        rep_gs = repair_overlaps(cell_features, max_iterations=50)
-        m_gs = calculate_normalized_metrics(cell_features, pin_features, edge_list)
-        if m_gs["overlap_ratio"] > 0 or m_gs["normalized_wl"] >= wl_pre_gs:
-            cell_features[:] = cf_backup  # revert if worse
+        rep_se = repair_overlaps(cell_features, max_iterations=100)
+        m_se = calculate_normalized_metrics(cell_features, pin_features, edge_list)
+        if m_se["overlap_ratio"] > 0 or m_se["normalized_wl"] >= wl_pre_swap:
+            cell_features[:] = cf_backup
         elif verbose:
-            print(f"  Global swap: {et_stats['swaps']}+{gs_stats['swaps']} swaps, "
-                  f"WL {wl_pre_gs:.4f} -> {m_gs['normalized_wl']:.4f}")
+            print(f"  Swap engine: {se_stats['swaps']} swaps, {se_stats['moves']} moves, "
+                  f"WL {wl_pre_swap:.4f} -> {m_se['normalized_wl']:.4f}")
 
     train_end = time.perf_counter()
 
