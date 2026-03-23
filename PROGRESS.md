@@ -350,7 +350,42 @@ Cross-row reinsertion helps test 1 (+4.8%) and test 8 (+1.0%). Within-row swaps 
 The swap engine currently evaluates only swapped/moved cells' WL, not displaced neighbors — needs fixing for within-row.
 
 **Current best approach:** Cell inflation (8%) + anchor loss (0.1) + v2 optuna config + detailed + swap engine + multistart.
-**Plots:** `ashvin/plots/run24_multistart/`
+
+**Visual analysis (`ashvin/plots/legalize_compare/`):**
+- Abacus fails on test 3 because it spreads cells across too many rows to minimize displacement — WL skyrockets
+- Abacus wins on test 2 because GD positions are already good neighborhoods and Abacus preserves them
+- Greedy packing is compact but topology-blind — pushes everything rightward
+- Core insight: minimizing displacement ≠ minimizing WL. Need legalization that's WL-aware AND compact.
+
+## Next Phase: Architecture Overhaul (in order)
+
+### Step 1: Interleaved Legalize-GD
+Instead of 500 GD epochs → legalize (big shock), do 5 rounds of:
+`GD(100 epochs) → legalize → GD(100 epochs, anchored) → legalize → ...`
+Each legalization is a small correction, not a reconstruction.
+GD naturally adapts to the legal landscape over successive rounds.
+
+### Step 2: Legalization-Aware GD
+Add differentiable "row penalty" to GD loss:
+- Cells want to be at integer y-values (row centers)
+- Cells want to not overlap their x-neighbors in the same row
+GD produces output that's *almost* legal, so legalization barely needs to touch it.
+Different from the failed row-snapping attempt (sin²πy) — this needs to be integrated
+into the main GD loop from the start, not bolted on at the end.
+
+### Step 3: Constructive Placement (skip GD entirely for init)
+Build placement greedily:
+1. Sort cells by connectivity degree (most-connected first)
+2. Place each cell at WL-optimal position given already-placed cells, snapped to legal row
+3. No overlaps by construction (check before placing)
+4. Then iterate with local swaps
+Fast (O(N * degree)), starts legal, no legalization shock.
+
+### Combined Architecture
+`Constructive init → interleaved GD-legalize → swap engine`
+Each phase builds on the previous. No single phase has to do all the work.
+
+**Plots:** `ashvin/plots/run24_multistart/`, `ashvin/plots/legalize_compare/`
 
 **What didn't work (new):**
 - Position-based cell swaps (global swap): Cells have different widths (1.0-3.0) in packed rows. Swapping positions always creates overlap. Fixed by switching to row-based reordering.

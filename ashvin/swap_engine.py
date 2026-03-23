@@ -331,40 +331,7 @@ def swap_engine(cell_features, pin_features, edge_list,
             tx, ty = barycentric_target(ci, positions, pin_features, edge_list,
                                         pin_to_cell, cell_edges)
 
-            # ── Move type A: within-row swaps ──
-            best_delta = -0.01  # minimum improvement threshold
-            best_swap = None
-            best_order = None
-
-            for cj in cur_row:
-                if cj == ci or cj in moved_cells:
-                    continue
-                if abs(heights[ci].item() - heights[cj].item()) > 0.01:
-                    continue
-
-                delta, new_order = try_within_row_swap(
-                    ci, cj, cur_row, positions, widths, heights,
-                    pin_features, edge_list, pin_to_cell, cell_edges,
-                    obstacles, cur_row_y)
-
-                if delta < best_delta:
-                    best_delta = delta
-                    best_swap = cj
-                    best_order = new_order
-
-            if best_order is not None:
-                # Apply the swap
-                start_x = get_row_start(cur_row, positions, widths)
-                packed = compact_row(best_order, widths, start_x)
-                for c, nx in packed:
-                    positions[c, 0] = nx
-                rows[cur_row_y] = best_order
-                moved_cells.add(ci)
-                moved_cells.add(best_swap)
-                iter_swaps += 1
-                continue
-
-            # ── Move type B: cross-row reinsertion ──
+            # ── Cross-row reinsertion ──
             # Try rows near barycentric target
             best_delta = -0.01  # low threshold — accept any improvement
             best_move = None

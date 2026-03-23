@@ -162,8 +162,38 @@ def solve(
         cell_features[:, 5] = initial_cell_features[:, 5]
 
     # === MULTI-PASS PIPELINE (compiler-style) ===
-    from ashvin.legalize import legalize as legalize_fallback
+    from ashvin.legalize import legalize as legalize_greedy
+    from ashvin.abacus import abacus_legalize
     from ashvin.wl_optimize import barycentric_refinement, targeted_scatter_reconverge
+
+    _leg_call = [0]
+
+    def legalize_fallback(cf, **kwargs):
+        """First call: try Abacus + greedy, pick best. After: greedy only (fast)."""
+        _leg_call[0] += 1
+
+        if _leg_call[0] <= 1:
+            from placement import calculate_normalized_metrics
+            pf, el = pin_features, edge_list
+            cf_pre = cf.clone()
+
+            cf_a = cf_pre.clone()
+            abacus_legalize(cf_a)
+            repair_overlaps(cf_a, max_iterations=200)
+            m_a = calculate_normalized_metrics(cf_a, pf, el)
+
+            cf_g = cf_pre.clone()
+            stats = legalize_greedy(cf_g, pin_features=pf, edge_list=el)
+            repair_overlaps(cf_g, max_iterations=200)
+            m_g = calculate_normalized_metrics(cf_g, pf, el)
+
+            if m_a["overlap_ratio"] == 0 and (m_g["overlap_ratio"] > 0 or m_a["normalized_wl"] < m_g["normalized_wl"]):
+                cf[:] = cf_a
+            else:
+                cf[:] = cf_g
+            return stats
+        else:
+            return legalize_greedy(cf, pin_features=pin_features, edge_list=edge_list)
 
     skip_scatter = config.get("_skip_scatter", False) if config else False
     num_macros_det = (cell_features[:, 5] > 1.5).sum().item()
