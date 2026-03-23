@@ -108,15 +108,8 @@ def solve(
         cell_features_current[:, 2:4] = pos
 
         progress = epoch / max(epochs - 1, 1)
-
-        # Annealed beta (softplus sharpness)
         beta = beta_start + (beta_end - beta_start) * progress
-
-        # Ramped lambda_overlap
         lam_ov = lambda_overlap_start + (lambda_overlap_end - lambda_overlap_start) * progress
-
-        # Check if nuclear loss is enabled
-        use_nuclear = config.get("lambda_nuclear", 0.0) if config else 0.0
 
         t0 = time.perf_counter()
         wl_loss = wirelength_attraction_loss(cell_features_current, pin_features, edge_list)
@@ -124,15 +117,9 @@ def solve(
         ov_loss = scalable_overlap_loss(cell_features_current, beta=beta)
         t2 = time.perf_counter()
         d_loss = density_loss(cell_features_current) if lambda_density > 0 else torch.tensor(0.0)
-
-        if use_nuclear > 0:
-            from ashvin.nuclear_loss import nuclear_loss
-            n_loss = nuclear_loss(cell_features_current, pin_features, edge_list, alpha=use_nuclear)
-        else:
-            n_loss = torch.tensor(0.0)
         t3 = time.perf_counter()
 
-        total_loss = lambda_wl * wl_loss + lam_ov * ov_loss + lambda_density * d_loss + n_loss
+        total_loss = lambda_wl * wl_loss + lam_ov * ov_loss + lambda_density * d_loss
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_([pos], max_norm=5.0)
         t4 = time.perf_counter()
@@ -150,9 +137,8 @@ def solve(
 
         if verbose and (epoch % 200 == 0 or epoch == epochs - 1):
             lr_now = optimizer.param_groups[0]["lr"]
-            print(f"  Epoch {epoch}/{epochs}: total={total_loss.item():.4f} "
-                  f"wl={wl_loss.item():.4f} overlap={ov_loss.item():.4f} "
-                  f"beta={beta:.2f} lam_ov={lam_ov:.1f} lr={lr_now:.5f}")
+            print(f"  Epoch {epoch}/{epochs}: wl={wl_loss.item():.4f} "
+                  f"overlap={ov_loss.item():.4f} beta={beta:.2f} lr={lr_now:.5f}")
 
     cell_features[:, 2:4] = pos.detach()
 

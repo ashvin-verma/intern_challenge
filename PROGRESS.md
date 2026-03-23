@@ -359,11 +359,11 @@ The swap engine currently evaluates only swapped/moved cells' WL, not displaced 
 
 ## Next Phase: Architecture Overhaul (in order)
 
-### Step 1: Interleaved Legalize-GD
-Instead of 500 GD epochs → legalize (big shock), do 5 rounds of:
-`GD(100 epochs) → legalize → GD(100 epochs, anchored) → legalize → ...`
-Each legalization is a small correction, not a reconstruction.
-GD naturally adapts to the legal landscape over successive rounds.
+### Step 1: Interleaved Legalize-GD — TESTED, DOESN'T HELP
+Split 500 epochs into 5 rounds of GD(100) → legalize → GD(100, anchored).
+Result: -0.2% to -4.8% on all tests. Mid-training legalization disrupts Adam momentum.
+The current pipeline (full GD → legalize → anchored-GD-polish × 5) is already the right structure.
+**Conclusion:** Interleaving at the GD level doesn't help. The bottleneck is elsewhere.
 
 ### Step 2: Legalization-Aware GD
 Add differentiable "row penalty" to GD loss:
@@ -373,8 +373,22 @@ GD produces output that's *almost* legal, so legalization barely needs to touch 
 Different from the failed row-snapping attempt (sin²πy) — this needs to be integrated
 into the main GD loop from the start, not bolted on at the end.
 
-### Step 3: Constructive Placement (skip GD entirely for init)
-Build placement greedily:
+### Step 3: Constructive Placement — Island Clustering (user's idea)
+Build placement bottom-up via multi-level clustering:
+1. **Form islands:** greedily cluster connected cells into small legal blocks (5-10 cells each)
+   - Each island is internally packed (no overlaps within)
+   - Place cells within island at WL-optimal positions relative to each other
+2. **Promote islands to macro-like units:** treat each island as a single large cell
+   - Width = island bounding box width, height = island bounding box height
+3. **Coarse placement:** place island-macros using force-directed or GD with LR schedule
+   - High LR initially for global exploration
+   - Low LR for fine-tuning positions
+4. **Uncluster:** expand islands back into individual cells
+5. **Fine refinement:** local swaps + shifts to polish
+No legalization needed — each level starts and stays legal.
+LR schedule controls coarse→fine transition.
+
+### Alternative Constructive: Greedy WL-Optimal
 1. Sort cells by connectivity degree (most-connected first)
 2. Place each cell at WL-optimal position given already-placed cells, snapped to legal row
 3. No overlaps by construction (check before placing)
@@ -382,7 +396,7 @@ Build placement greedily:
 Fast (O(N * degree)), starts legal, no legalization shock.
 
 ### Combined Architecture
-`Constructive init → interleaved GD-legalize → swap engine`
+`Constructive init (island clustering) → optional GD polish → swap engine`
 Each phase builds on the previous. No single phase has to do all the work.
 
 **Plots:** `ashvin/plots/run24_multistart/`, `ashvin/plots/legalize_compare/`
