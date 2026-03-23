@@ -422,9 +422,26 @@ This combines the connectivity-aware clustering with the proven GD optimizer.
 Island init beats random init AND spectral on tests 1-2. Spectral still best on test 3.
 Greedy (random init) still best on tests 4-5. No single strategy dominates.
 
-### Combined Architecture
-`Multistart (island_init + greedy + spectral) → GD pipeline (inflate+anchor) → swap engine`
-Each init strategy feeds into the same GD pipeline. Best result kept per test.
+### Future idea: Hub-spoke clustering init
+Highest-connectivity cells serve as hubs, less-connected cells as spokes.
+Form clusters around hubs, place hub clusters as units.
+Different from islands (which grow greedily) — this is degree-centric.
+
+### Init strategy comparison (single pipeline, no multistart):
+| T | random | spectral | force_dir | sequential |
+|---|--------|----------|-----------|------------|
+| 1 | **0.406** | 0.408 | 0.426 | 0.444 |
+| 2 | **0.322** | 0.518 | 0.392 | 0.380 |
+| 3 | 0.403 | **0.311** | 0.419 | 0.419 |
+| 4 | **0.431** | 0.504 | 0.434 | 0.452 |
+| 5 | **0.401** | 0.498 | 0.407 | 0.426 |
+| 6 | 0.327 | 0.419 | **0.323** | **0.322** |
+| 7 | **0.306** | 0.339 | 0.335 | 0.359 |
+| **AVG** | **0.371** | 0.428 | 0.391 | 0.400 |
+
+**Random wins 5/7 tests.** GD is robust to random init — connectivity-aware inits
+cluster cells too tightly, making overlap resolution harder. Init is NOT the bottleneck.
+**Legalization is the bottleneck.** Moving to fix legalization next.
 
 **Plots:** `ashvin/plots/run24_multistart/`, `ashvin/plots/legalize_compare/`
 
