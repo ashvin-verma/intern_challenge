@@ -458,10 +458,9 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
         rm.add_macro(i, positions[i, 0].item(), positions[i, 1].item(),
                      widths[i].item(), heights[i].item())
 
-    # ── Phase 1: Place at barycentric targets (overlapping) ──
-    # Iterative averaging: each cell moves toward centroid of neighbors.
-    # Like force-directed but without repulsion — just attraction.
-    # 20 iterations is enough to converge.
+    # ── Phase 1: Iterative barycentric averaging ──
+    # Each cell moves toward centroid of all its neighbors (macros + std).
+    # Like force-directed without repulsion. 20 iterations converges.
     std_cells = list(range(num_macros, N))
 
     for _iteration in range(20):
@@ -475,14 +474,9 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
                 wy += positions[n, 1].item() * weight
                 tw += weight
             if tw > 0:
-                # Move 70% toward centroid (damped to avoid oscillation)
                 cx, cy = wx / tw, wy / tw
                 positions[ci, 0] = 0.3 * positions[ci, 0].item() + 0.7 * cx
                 positions[ci, 1] = 0.3 * positions[ci, 1].item() + 0.7 * cy
-
-    # Save barycentric targets (where WL wants each cell)
-    target_x = positions[num_macros:, 0].clone()
-    target_y = positions[num_macros:, 1].clone()
 
     # ── Phase 2: Assign to rows and spread ──
     # Precompute blocked intervals
