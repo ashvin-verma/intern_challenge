@@ -462,6 +462,33 @@ GD→legalize→refine pipeline is co-adapted. Changing one component without
 re-adapting the others causes regression. This is the fundamental ceiling
 of the bolt-on approach.
 
+### Constructive v2: legal-from-the-start placement
+No GD. No legalization. Place cells one-by-one at WL-optimal positions, then swap.
+1. Place macros (spread apart)
+2. Place std cells by degree (most-connected first, at barycentric target)
+3. Swap refinement (cross-row moves, 50 iterations)
+
+Results (with overlap fix — compact after every move):
+| T | N | GD pipe | Constr v2 | OV |
+|---|---|---------|-----------|-----|
+| 1 | 22 | 0.387 | **0.343** | 0.09 |
+| 2 | 28 | 0.338 | 0.352 | 0.11 |
+| 3 | 32 | 0.395 | **0.359** | 0.06 |
+| 4 | 53 | 0.431 | **0.387** | 0.06 |
+| 5 | 79 | 0.400 | 0.426 | 0.04 |
+| 6 | 105 | 0.320 | 0.337 | 0.05 |
+| 7 | 155 | 0.302 | 0.362 | 0.04 |
+| 8 | 157 | 0.325 | 0.388 | 0.40 |
+| 9 | 208 | 0.324 | 0.346 | 0.03 |
+
+Wins on tests 1, 3, 4 (WL 10-12% better than GD). Loses on larger tests.
+Still has residual overlap (3-40%) — needs better compaction.
+Runtime is fast (3-42s, vs 30-300s for GD pipeline).
+
+**Key insight:** The constructive approach produces competitive WL on small tests
+with zero GD overhead. The swap engine needs more iterations and better moves
+to match GD on larger tests. This IS the right architecture — needs refinement.
+
 **Plots:** `ashvin/plots/run24_multistart/`, `ashvin/plots/legalize_compare/`
 
 **What didn't work (new):**
