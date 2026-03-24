@@ -304,24 +304,22 @@ class RowManager:
 
         return result_x
 
-    def place_cell(self, ci, x, row_y, w, positions):
-        """Place a cell in a row and compact to ensure no overlaps."""
+    def place_cell(self, ci, x, row_y, w, positions, compact=True):
+        """Place a cell in a row. Optionally compact to resolve overlaps."""
         if row_y not in self.rows:
             self.rows[row_y] = []
 
-        # Add to row
         left = x - w / 2
         cells = self.rows[row_y]
         cells.append((left, w, ci))
         cells.sort(key=lambda t: t[0])
         self.cell_row[ci] = row_y
 
-        # Set position
         positions[ci, 0] = x
         positions[ci, 1] = row_y
 
-        # Compact to resolve any overlaps
-        self.compact_row(row_y, positions, None)
+        if compact:
+            self.compact_row(row_y, positions, None)
 
     def remove_cell(self, ci):
         """Remove a cell from its row."""
@@ -337,11 +335,11 @@ class RowManager:
         return [ci for _, _, ci in self.rows.get(row_y, [])]
 
     def compact_row(self, row_y, positions, widths=None):
-        """Re-compact row: resolve cell-cell overlaps only.
+        """Bidirectional compaction: push right then pull left, repeat.
 
-        Cells were placed at macro-legal positions by legal_x during construction.
-        Compact only pushes right when cells actually overlap each other.
-        Does NOT re-check macros (that would cascade).
+        Right sweep: resolve overlaps by pushing right (skip macro intervals).
+        Left sweep: pull cells back toward their original target where room exists.
+        This distributes displacement symmetrically instead of piling everything right.
         """
         cells = self.rows.get(row_y, [])
         if not cells:
@@ -349,21 +347,58 @@ class RowManager:
 
         cells.sort(key=lambda t: t[0])
 
-        # Right-push for cell-cell overlaps, skip blocked macro intervals
         r_idx = self.row_y_to_idx.get(row_y)
         blocked = self.blocked.get(r_idx, []) if r_idx is not None else []
 
+        def is_blocked(x, w):
+            half = w / 2 + 1e-3
+            for blo, bhi in blocked:
+                if blo - half < x < bhi + half:
+                    return True
+            return False
+
+        def skip_blocked_right(x, w):
+            half = w / 2 + 1e-3
+            for blo, bhi in blocked:
+                if blo - half < x < bhi + half:
+                    return bhi + half + 1e-6
+            return x
+
+        # Right sweep: resolve overlaps
         for i in range(1, len(cells)):
             prev_left, prev_w, _ = cells[i - 1]
             prev_right = prev_left + prev_w
             cur_left, cur_w, ci = cells[i]
             if cur_left < prev_right - 1e-6:
-                new_x = prev_right + cur_w / 2
-                # If new_x is in a blocked interval, jump past it
-                half = cur_w / 2 + 1e-3
-                for blo, bhi in blocked:
-                    if blo - half < new_x < bhi + half:
-                        new_x = bhi + half + 1e-6
+                new_x = skip_blocked_right(prev_right + cur_w / 2, cur_w)
+                positions[ci, 0] = new_x
+                cells[i] = (new_x - cur_w / 2, cur_w, ci)
+
+        # Left sweep: pull cells back where room exists
+        for i in range(len(cells) - 2, -1, -1):
+            cur_left, cur_w, ci = cells[i]
+            cur_x = cur_left + cur_w / 2
+
+            # How far left can this cell go?
+            if i == 0:
+                min_x = cur_x - 100  # no left neighbor constraint
+            else:
+                prev_left, prev_w, _ = cells[i - 1]
+                min_x = prev_left + prev_w + cur_w / 2
+
+            # How far right must it stay? (don't overlap next cell)
+            if i < len(cells) - 1:
+                next_left = cells[i + 1][0]
+                max_x = next_left - cur_w / 2
+            else:
+                max_x = cur_x + 100
+
+            # Try to move toward legal_x target (original placement position)
+            target_x = self.legal_x(row_y, positions[ci, 0].item(), cur_w)
+            new_x = max(min_x, min(target_x, max_x))
+
+            # Don't move into blocked interval
+            if not is_blocked(new_x, cur_w):
                 positions[ci, 0] = new_x
                 cells[i] = (new_x - cur_w / 2, cur_w, ci)
 
@@ -387,20 +422,15 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
     rm = RowManager(row_height=1.0)
 
     # Step 1: Place macros with connectivity-aware gaps
-    # Count shared std cells between each macro pair
-    macro_shared = {}  # (i,j) -> count of std cells connected to both
+    # Compute shared std cell total width between each macro pair
+    macro_shared_width = {}  # (i,j) -> total width of std cells connected to both
     for ci in range(num_macros, N):
         connected_macros = [n for n in neighbors.get(ci, {}) if n < num_macros]
         for a in range(len(connected_macros)):
             for b in range(a + 1, len(connected_macros)):
                 pair = (min(connected_macros[a], connected_macros[b]),
                         max(connected_macros[a], connected_macros[b]))
-                macro_shared[pair] = macro_shared.get(pair, 0) + 1
-
-    # Push macros apart: minimum gap = base + extra per shared connection
-    # Shared cells need room to sit between the macros
-    base_gap = 0.5  # small minimum gap
-    gap_per_shared = 0.3  # modest extra gap per shared std cell
+                macro_shared_width[pair] = macro_shared_width.get(pair, 0) + widths[ci].item()
 
     if num_macros > 1:
         for _pass in range(300):
@@ -412,11 +442,15 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
                     wi, hi = widths[i].item(), heights[i].item()
                     wj, hj = widths[j].item(), heights[j].item()
 
-                    # Required gap between macro edges
-                    shared = macro_shared.get((min(i, j), max(i, j)), 0)
-                    gap = base_gap + gap_per_shared * min(shared, 10)
+                    pair = (min(i, j), max(i, j))
+                    shared_w = macro_shared_width.get(pair, 0)
 
-                    # Check separation including gap
+                    # Gap = shared cell width / rows spanned by smaller macro
+                    # Shared cells distribute across the overlapping rows
+                    smaller_h = min(hi, hj)
+                    rows_between = max(1, int(smaller_h))
+                    gap = shared_w / rows_between + 0.5  # +0.5 for margin
+
                     min_sep_x = (wi + wj) / 2 + gap
                     min_sep_y = (hi + hj) / 2 + gap
                     ov_x = min_sep_x - abs(xi - xj)
@@ -497,7 +531,11 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
 
         positions[ci, 0] = best_x
         positions[ci, 1] = best_ry
-        rm.place_cell(ci, best_x, best_ry, w, positions)
+        rm.place_cell(ci, best_x, best_ry, w, positions, compact=False)
+
+    # Final compaction: resolve all cell-cell overlaps per row
+    for ry in list(rm.rows.keys()):
+        rm.compact_row(ry, positions)
 
     cell_features[:, 2:4] = positions
     return rm

@@ -65,7 +65,7 @@ def plot_with_overlaps(cf, pf, el, title, filepath):
     plt.close()
 
 
-for tid, nm, nsc, seed in [(1, 2, 20, 1001), (4, 3, 50, 1004), (8, 7, 150, 1008)]:
+for tid, nm, nsc, seed in [(1, 2, 20, 1001), (6, 5, 100, 1006), (8, 7, 150, 1008)]:
     torch.manual_seed(seed)
     cf, pf, el = generate_placement_input(nm, nsc)
     N = cf.shape[0]
