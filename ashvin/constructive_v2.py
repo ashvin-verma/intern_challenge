@@ -478,26 +478,104 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
                 positions[ci, 0] = 0.3 * positions[ci, 0].item() + 0.7 * cx
                 positions[ci, 1] = 0.3 * positions[ci, 1].item() + 0.7 * cy
 
-    # ── Phase 2: Assign to rows and spread ──
-    # Precompute blocked intervals
+    # ── Phase 2: Assign to rows and spread with WL-aware overlap resolution ──
+    # Save ideal positions from phase 1
+    ideal_x = positions[num_macros:, 0].clone()
+    ideal_y = positions[num_macros:, 1].clone()
+
     y_min = positions[:, 1].min().item() - 15
     y_max = positions[:, 1].max().item() + 15
     rm.init_blocked(cell_features, num_macros, y_min, y_max)
 
-    # Assign each std cell to nearest legal row
+    # Step 2a: Assign each std cell to nearest legal row, at legal x
     for ci in std_cells:
         w = widths[ci].item()
         ty = positions[ci, 1].item()
-        # Snap to nearest row
         ry = round(ty / rm.row_height) * rm.row_height
-        # Get legal x
         tx = positions[ci, 0].item()
         x = rm.legal_x(ry, tx, w)
         positions[ci, 0] = x
         positions[ci, 1] = ry
         rm.place_cell(ci, x, ry, w, positions, compact=False)
 
-    # Compact all rows (bidirectional)
+    # Step 2b: WL-aware overlap resolution
+    # For each row, resolve overlaps by moving the LESS WL-sensitive cell.
+    # Iterate until stable.
+    pin_to_cell, _, cell_edges_local = build_cell_graph(pin_features, edge_list)
+
+    for _sweep in range(5):
+        any_moved = False
+        for ry in list(rm.rows.keys()):
+            cells = rm.rows.get(ry, [])
+            if len(cells) <= 1:
+                continue
+            cells.sort(key=lambda t: t[0])
+
+            i = 0
+            while i < len(cells) - 1:
+                left_i, w_i, ci = cells[i]
+                left_j, w_j, cj = cells[i + 1]
+                right_i = left_i + w_i
+
+                if right_i > left_j + 1e-6:
+                    # Overlap! Decide who moves.
+                    overlap_amount = right_i - left_j
+
+                    # Compute WL sensitivity: how much does moving hurt each cell?
+                    wl_i = cell_wl(ci, positions, pin_features, edge_list,
+                                   pin_to_cell, cell_edges_local)
+                    wl_j = cell_wl(cj, positions, pin_features, edge_list,
+                                   pin_to_cell, cell_edges_local)
+
+                    # Also check: can either cell move to an adjacent row instead?
+                    ci_ideal_y = ideal_y[ci - num_macros].item() if ci >= num_macros else ry
+                    cj_ideal_y = ideal_y[cj - num_macros].item() if cj >= num_macros else ry
+
+                    moved_to_other_row = False
+
+                    # Try moving the less-connected cell to an adjacent row
+                    mover = cj if wl_j <= wl_i else ci
+                    mover_w = widths[mover].item()
+
+                    for alt_ry in [ry - 1.0, ry + 1.0]:
+                        alt_x = rm.legal_x(alt_ry, positions[mover, 0].item(), mover_w)
+                        # Check if alt row has room (no overlap with existing cells there)
+                        alt_cells = rm.rows.get(alt_ry, [])
+                        fits = True
+                        for al, aw, _ in alt_cells:
+                            if abs(alt_x - (al + aw/2)) < (mover_w + aw) / 2:
+                                fits = False
+                                break
+                        if fits:
+                            # Move to adjacent row
+                            rm.remove_cell(mover)
+                            positions[mover, 0] = alt_x
+                            positions[mover, 1] = alt_ry
+                            rm.place_cell(mover, alt_x, alt_ry, mover_w, positions,
+                                          compact=False)
+                            moved_to_other_row = True
+                            any_moved = True
+                            # Refresh cells list for this row
+                            cells = rm.rows.get(ry, [])
+                            cells.sort(key=lambda t: t[0])
+                            break
+
+                    if not moved_to_other_row:
+                        # Push within row: always push right cell rightward
+                        # (pushing left causes infinite loops)
+                        new_x = right_i + w_j / 2
+                        new_x = rm.legal_x(ry, new_x, w_j)
+                        positions[cj, 0] = new_x
+                        cells[i + 1] = (new_x - w_j / 2, w_j, cj)
+                        any_moved = True
+                i += 1
+
+            rm.rows[ry] = cells
+
+        if not any_moved:
+            break
+
+    # Final bidirectional compact for any remaining issues
     for ry in list(rm.rows.keys()):
         rm.compact_row(ry, positions)
 
