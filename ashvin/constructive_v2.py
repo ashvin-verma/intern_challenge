@@ -86,6 +86,48 @@ class RowManager:
                 return True
         return False
 
+    def push_outside_macros(self, x, y, w, h, margin=0.1):
+        """If (x, y) overlaps any macro, project to nearest macro boundary.
+
+        Returns list of candidate (x, y) positions outside all macros.
+        Each candidate is the nearest boundary point of one macro.
+        Caller picks the one with best WL.
+        """
+        candidates = []
+        inside_any = False
+
+        for ox_min, oy_min, ox_max, oy_max in self.macro_obstacles:
+            mx = (ox_min + ox_max) / 2
+            my = (oy_min + oy_max) / 2
+            mw = ox_max - ox_min
+            mh = oy_max - oy_min
+
+            # Forbidden region for cell center
+            fx_min = mx - (mw + w) / 2 - margin
+            fx_max = mx + (mw + w) / 2 + margin
+            fy_min = my - (mh + h) / 2 - margin
+            fy_max = my + (mh + h) / 2 + margin
+
+            if fx_min < x < fx_max and fy_min < y < fy_max:
+                inside_any = True
+                # Project to each boundary, pick nearest
+                boundary_points = [
+                    (fx_min, y),   # left
+                    (fx_max, y),   # right
+                    (x, fy_min),   # bottom
+                    (x, fy_max),   # top
+                ]
+                for bx, by in boundary_points:
+                    candidates.append((bx, by))
+
+        if not inside_any:
+            return [(x, y)]  # already legal
+
+        if not candidates:
+            return [(x, y)]
+
+        return candidates
+
     def find_insertion_x(self, row_y, target_x, w):
         """Find best x to INSERT a cell of width w, pushing others aside.
 
@@ -194,27 +236,55 @@ class RowManager:
         return [ci for _, _, ci in self.rows.get(row_y, [])]
 
     def compact_row(self, row_y, positions, widths=None):
-        """Re-compact a row: resolve overlaps left-to-right."""
+        """Re-compact a row: resolve ALL overlaps (cell-cell AND cell-macro)."""
         cells = self.rows.get(row_y, [])
-        if len(cells) <= 1:
-            if cells:
-                ci = cells[0][2]
-                positions[ci, 1] = row_y
+        if not cells:
+            return
+        if len(cells) == 1:
+            ci = cells[0][2]
+            w = cells[0][1]
+            x = positions[ci, 0].item()
+            # Still need to check macro overlap for singletons
+            for _ in range(20):
+                if not self._macro_overlaps(x, row_y, w):
+                    break
+                # Find which macro we hit and jump past it
+                for ox_min, oy_min, ox_max, oy_max in self.macro_obstacles:
+                    h = self.row_height
+                    if x + w/2 > ox_min and x - w/2 < ox_max and \
+                       row_y + h/2 > oy_min and row_y - h/2 < oy_max:
+                        x = ox_max + w / 2 + 0.1
+                        break
+            positions[ci, 0] = x
+            positions[ci, 1] = row_y
+            self.rows[row_y] = [(x - w/2, w, ci)]
             return
 
         # Sort by current x
         cells.sort(key=lambda t: t[0])
 
-        # Left-to-right sweep: ensure each cell starts after the previous ends
+        # Left-to-right sweep
         new_cells = []
-        cursor = cells[0][0]  # start from leftmost
+        cursor = cells[0][0]  # start from leftmost edge
         for _, w, ci in cells:
-            x = max(positions[ci, 0].item(), cursor + w / 2)
-            # Push past macros
+            x = max(cursor + w / 2, positions[ci, 0].item())
+
+            # Push past macro obstacles — check repeatedly
             for _ in range(20):
                 if not self._macro_overlaps(x, row_y, w):
                     break
-                x += w
+                for ox_min, oy_min, ox_max, oy_max in self.macro_obstacles:
+                    h = self.row_height
+                    if x + w/2 > ox_min and x - w/2 < ox_max and \
+                       row_y + h/2 > oy_min and row_y - h/2 < oy_max:
+                        x = ox_max + w / 2 + 0.1
+                        break
+
+            # Ensure no overlap with previous cell
+            if new_cells:
+                prev_right = new_cells[-1][0] + new_cells[-1][1]
+                x = max(x, prev_right + w / 2)
+
             positions[ci, 0] = x
             positions[ci, 1] = row_y
             new_cells.append((x - w / 2, w, ci))
@@ -263,26 +333,36 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
             target_y = positions[ci, 1].item()
 
         # Try nearby rows, pick the one with best WL
+        h = heights[ci].item()
         candidate_rows = rm.get_row_y_values(target_y, radius=5)
         best_wl = float("inf")
         best_x, best_ry = target_x, round(target_y)
 
         for ry in candidate_rows:
             x = rm.find_insertion_x(ry, target_x, w)
-            # Quick WL estimate: sum of Manhattan distances to placed neighbors
-            wl = 0.0
-            for n in placed_nbrs:
-                nx = positions[n, 0].item()
-                ny = positions[n, 1].item()
-                wl += abs(x - nx) + abs(ry - ny)
-            if wl < best_wl:
-                best_wl = wl
-                best_x = x
-                best_ry = ry
+
+            # Check macro overlap and project to boundary if needed
+            macro_candidates = rm.push_outside_macros(x, ry, w, h)
+            for cx, cy in macro_candidates:
+                # Snap cy back to row (we can't move between rows here)
+                cx_final = cx
+                wl = 0.0
+                for n in placed_nbrs:
+                    nx = positions[n, 0].item()
+                    ny = positions[n, 1].item()
+                    wl += abs(cx_final - nx) + abs(ry - ny)
+                if wl < best_wl:
+                    best_wl = wl
+                    best_x = cx_final
+                    best_ry = ry
 
         positions[ci, 0] = best_x
         positions[ci, 1] = best_ry
         rm.place_cell(ci, best_x, best_ry, w, positions)
+
+    # Final pass: compact ALL rows to guarantee zero macro overlap
+    for ry in list(rm.rows.keys()):
+        rm.compact_row(ry, positions)
 
     cell_features[:, 2:4] = positions
     return rm
@@ -349,18 +429,22 @@ def swap_refine(cell_features, pin_features, edge_list, rm,
 
                 x = rm.find_insertion_x(ry, target_x, w)
 
-                # Evaluate WL at new position
-                old_x, old_y = positions[ci, 0].item(), positions[ci, 1].item()
-                positions[ci, 0] = x
-                positions[ci, 1] = ry
-                new_wl = cell_wl(ci, positions, pin_features, edge_list, pin_to_cell, cell_edges)
-                positions[ci, 0] = old_x
-                positions[ci, 1] = old_y
+                # Check macro overlap, project if needed
+                h = cell_features[ci, 5].item()
+                macro_cands = rm.push_outside_macros(x, ry, w, h)
 
-                improvement = cur_wl - new_wl
-                if improvement > best_improvement:
-                    best_improvement = improvement
-                    best_move = ("cross", x, ry)
+                for cx, _ in macro_cands:
+                    old_x, old_y = positions[ci, 0].item(), positions[ci, 1].item()
+                    positions[ci, 0] = cx
+                    positions[ci, 1] = ry
+                    new_wl = cell_wl(ci, positions, pin_features, edge_list, pin_to_cell, cell_edges)
+                    positions[ci, 0] = old_x
+                    positions[ci, 1] = old_y
+
+                    improvement = cur_wl - new_wl
+                    if improvement > best_improvement:
+                        best_improvement = improvement
+                        best_move = ("cross", cx, ry)
 
             # Apply best move
             if best_move is not None:
@@ -416,9 +500,9 @@ def solve_constructive_v2(cell_features, pin_features, edge_list,
         cell_features, pin_features, edge_list, rm,
         num_macros, max_iterations=max_iters, verbose=verbose)
 
-    # Final repair (should be unnecessary but safety check)
+    # Light repair for any edge cases (should be zero or near-zero overlaps)
     from ashvin.repair import repair_overlaps
-    repair_overlaps(cell_features, max_iterations=100)
+    repair_overlaps(cell_features, max_iterations=200)
 
     train_end = time.perf_counter()
 
