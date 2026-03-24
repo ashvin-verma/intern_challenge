@@ -411,7 +411,13 @@ class RowManager:
 # ── Constructive placement ──────────────────────────────────────────
 
 def construct_placement(cell_features, pin_features, edge_list, num_macros):
-    """Place all cells in legal positions, greedily minimizing WL."""
+    """Two-phase constructive: cluster at targets, then spread to legalize.
+
+    Phase 1: Place all cells at barycentric targets (allow overlaps).
+             Iterate averaging positions toward connected neighbors.
+    Phase 2: Assign to rows, spread within rows using Abacus-style
+             cluster merge to resolve overlaps minimally.
+    """
     N = cell_features.shape[0]
     positions = cell_features[:, 2:4].detach()
     widths = cell_features[:, 4].detach()
@@ -421,17 +427,7 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
 
     rm = RowManager(row_height=1.0)
 
-    # Step 1: Place macros with connectivity-aware gaps
-    # Compute shared std cell total width between each macro pair
-    macro_shared_width = {}  # (i,j) -> total width of std cells connected to both
-    for ci in range(num_macros, N):
-        connected_macros = [n for n in neighbors.get(ci, {}) if n < num_macros]
-        for a in range(len(connected_macros)):
-            for b in range(a + 1, len(connected_macros)):
-                pair = (min(connected_macros[a], connected_macros[b]),
-                        max(connected_macros[a], connected_macros[b]))
-                macro_shared_width[pair] = macro_shared_width.get(pair, 0) + widths[ci].item()
-
+    # ── Step 1: Legalize macros (just push apart, no gaps) ──
     if num_macros > 1:
         for _pass in range(300):
             any_ov = False
@@ -441,21 +437,8 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
                     xj, yj = positions[j, 0].item(), positions[j, 1].item()
                     wi, hi = widths[i].item(), heights[i].item()
                     wj, hj = widths[j].item(), heights[j].item()
-
-                    pair = (min(i, j), max(i, j))
-                    shared_w = macro_shared_width.get(pair, 0)
-
-                    # Gap = shared cell width / rows spanned by smaller macro
-                    # Shared cells distribute across the overlapping rows
-                    smaller_h = min(hi, hj)
-                    rows_between = max(1, int(smaller_h))
-                    gap = shared_w / rows_between + 0.5  # +0.5 for margin
-
-                    min_sep_x = (wi + wj) / 2 + gap
-                    min_sep_y = (hi + hj) / 2 + gap
-                    ov_x = min_sep_x - abs(xi - xj)
-                    ov_y = min_sep_y - abs(yi - yj)
-
+                    ov_x = (wi + wj) / 2 - abs(xi - xj)
+                    ov_y = (hi + hj) / 2 - abs(yi - yj)
                     if ov_x > 0 and ov_y > 0:
                         any_ov = True
                         if ov_x <= ov_y:
@@ -475,65 +458,52 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
         rm.add_macro(i, positions[i, 0].item(), positions[i, 1].item(),
                      widths[i].item(), heights[i].item())
 
-    # Precompute blocked intervals per row (AFTER macro legalization)
-    all_y = positions[num_macros:, 1]
-    y_min = all_y.min().item() - 15
-    y_max = all_y.max().item() + 15
-    rm.init_blocked(cell_features, num_macros, y_min, y_max)
-
-    # Step 2: Place std cells — spatially aware order
-    # For each std cell, find its "anchor" macro (most-connected macro).
-    # Sort by: anchor macro position (left to right), then by degree.
-    # This ensures cells fill gaps near their connected macros.
+    # ── Phase 1: Place at barycentric targets (overlapping) ──
+    # Iterative averaging: each cell moves toward centroid of neighbors.
+    # Like force-directed but without repulsion — just attraction.
+    # 20 iterations is enough to converge.
     std_cells = list(range(num_macros, N))
 
-    def placement_key(ci):
-        # Find most-connected macro
-        macro_nbrs = {n: neighbors[ci].get(n, 0) for n in neighbors.get(ci, {}) if n < num_macros}
-        if macro_nbrs:
-            anchor = max(macro_nbrs, key=macro_nbrs.get)
-            anchor_x = positions[anchor, 0].item()
-        else:
-            anchor_x = 0.0
-        degree = len(neighbors.get(ci, {}))
-        return (anchor_x, -degree)  # group by macro x, then highest degree first
+    for _iteration in range(20):
+        for ci in std_cells:
+            nbrs = neighbors.get(ci, {})
+            if not nbrs:
+                continue
+            wx, wy, tw = 0.0, 0.0, 0.0
+            for n, weight in nbrs.items():
+                wx += positions[n, 0].item() * weight
+                wy += positions[n, 1].item() * weight
+                tw += weight
+            if tw > 0:
+                # Move 70% toward centroid (damped to avoid oscillation)
+                cx, cy = wx / tw, wy / tw
+                positions[ci, 0] = 0.3 * positions[ci, 0].item() + 0.7 * cx
+                positions[ci, 1] = 0.3 * positions[ci, 1].item() + 0.7 * cy
 
-    std_cells.sort(key=placement_key)
+    # Save barycentric targets (where WL wants each cell)
+    target_x = positions[num_macros:, 0].clone()
+    target_y = positions[num_macros:, 1].clone()
 
+    # ── Phase 2: Assign to rows and spread ──
+    # Precompute blocked intervals
+    y_min = positions[:, 1].min().item() - 15
+    y_max = positions[:, 1].max().item() + 15
+    rm.init_blocked(cell_features, num_macros, y_min, y_max)
+
+    # Assign each std cell to nearest legal row
     for ci in std_cells:
         w = widths[ci].item()
+        ty = positions[ci, 1].item()
+        # Snap to nearest row
+        ry = round(ty / rm.row_height) * rm.row_height
+        # Get legal x
+        tx = positions[ci, 0].item()
+        x = rm.legal_x(ry, tx, w)
+        positions[ci, 0] = x
+        positions[ci, 1] = ry
+        rm.place_cell(ci, x, ry, w, positions, compact=False)
 
-        # Compute target: barycentric center of placed neighbors
-        placed_nbrs = [n for n in neighbors.get(ci, {}) if n in rm.cell_row or n < num_macros]
-
-        if placed_nbrs:
-            target_x = sum(positions[n, 0].item() for n in placed_nbrs) / len(placed_nbrs)
-            target_y = sum(positions[n, 1].item() for n in placed_nbrs) / len(placed_nbrs)
-        else:
-            target_x = positions[ci, 0].item()
-            target_y = positions[ci, 1].item()
-
-        # Try nearby rows, pick the one with best WL
-        candidate_rows = rm.get_row_y_values(target_y, radius=5)
-        best_wl = float("inf")
-        best_x, best_ry = target_x, round(target_y)
-
-        for ry in candidate_rows:
-            # Get nearest legal x (guaranteed no macro overlap)
-            x = rm.legal_x(ry, target_x, w)
-            wl = 0.0
-            for n in placed_nbrs:
-                wl += abs(x - positions[n, 0].item()) + abs(ry - positions[n, 1].item())
-            if wl < best_wl:
-                best_wl = wl
-                best_x = x
-                best_ry = ry
-
-        positions[ci, 0] = best_x
-        positions[ci, 1] = best_ry
-        rm.place_cell(ci, best_x, best_ry, w, positions, compact=False)
-
-    # Final compaction: resolve all cell-cell overlaps per row
+    # Compact all rows (bidirectional)
     for ry in list(rm.rows.keys()):
         rm.compact_row(ry, positions)
 
