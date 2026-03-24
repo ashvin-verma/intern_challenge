@@ -337,44 +337,40 @@ class RowManager:
         return [ci for _, _, ci in self.rows.get(row_y, [])]
 
     def compact_row(self, row_y, positions, widths=None):
-        """Re-compact row: left-to-right sweep, skip macro blocked intervals."""
+        """Re-compact row: resolve cell-cell overlaps only.
+
+        Cells were placed at macro-legal positions by legal_x during construction.
+        Compact only pushes right when cells actually overlap each other.
+        Does NOT re-check macros (that would cascade).
+        """
         cells = self.rows.get(row_y, [])
         if not cells:
             return
 
-        # Get blocked intervals for this row
+        cells.sort(key=lambda t: t[0])
+
+        # Right-push for cell-cell overlaps, skip blocked macro intervals
         r_idx = self.row_y_to_idx.get(row_y)
         blocked = self.blocked.get(r_idx, []) if r_idx is not None else []
 
-        cells.sort(key=lambda t: t[0])
-        new_cells = []
-        for _, w, ci in cells:
-            x = positions[ci, 0].item()
-            if new_cells:
-                prev_right = new_cells[-1][0] + new_cells[-1][1]
-                x = max(x, prev_right + w / 2)
-
-            # Skip over any blocked interval this cell center falls in
-            half = w / 2 + 1e-3
-            for _ in range(20):
-                in_blocked = False
+        for i in range(1, len(cells)):
+            prev_left, prev_w, _ = cells[i - 1]
+            prev_right = prev_left + prev_w
+            cur_left, cur_w, ci = cells[i]
+            if cur_left < prev_right - 1e-6:
+                new_x = prev_right + cur_w / 2
+                # If new_x is in a blocked interval, jump past it
+                half = cur_w / 2 + 1e-3
                 for blo, bhi in blocked:
-                    if blo - half < x < bhi + half:
-                        x = bhi + half + 1e-6
-                        in_blocked = True
-                        break
-                if not in_blocked:
-                    break
+                    if blo - half < new_x < bhi + half:
+                        new_x = bhi + half + 1e-6
+                positions[ci, 0] = new_x
+                cells[i] = (new_x - cur_w / 2, cur_w, ci)
 
-            # Re-check previous cell after macro skip
-            if new_cells:
-                prev_right = new_cells[-1][0] + new_cells[-1][1]
-                x = max(x, prev_right + w / 2)
-
-            positions[ci, 0] = x
+        for _, _, ci in cells:
             positions[ci, 1] = row_y
-            new_cells.append((x - w / 2, w, ci))
-        self.rows[row_y] = new_cells
+
+        self.rows[row_y] = cells
 
 
 # ── Constructive placement ──────────────────────────────────────────
@@ -390,9 +386,24 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
 
     rm = RowManager(row_height=1.0)
 
-    # Step 1: Legalize macros (push apart until no overlap)
+    # Step 1: Place macros with connectivity-aware gaps
+    # Count shared std cells between each macro pair
+    macro_shared = {}  # (i,j) -> count of std cells connected to both
+    for ci in range(num_macros, N):
+        connected_macros = [n for n in neighbors.get(ci, {}) if n < num_macros]
+        for a in range(len(connected_macros)):
+            for b in range(a + 1, len(connected_macros)):
+                pair = (min(connected_macros[a], connected_macros[b]),
+                        max(connected_macros[a], connected_macros[b]))
+                macro_shared[pair] = macro_shared.get(pair, 0) + 1
+
+    # Push macros apart: minimum gap = base + extra per shared connection
+    # Shared cells need room to sit between the macros
+    base_gap = 2.0  # minimum gap even with no shared cells
+    gap_per_shared = 1.0  # extra gap per shared std cell
+
     if num_macros > 1:
-        for _pass in range(200):
+        for _pass in range(300):
             any_ov = False
             for i in range(num_macros):
                 for j in range(i + 1, num_macros):
@@ -400,8 +411,17 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
                     xj, yj = positions[j, 0].item(), positions[j, 1].item()
                     wi, hi = widths[i].item(), heights[i].item()
                     wj, hj = widths[j].item(), heights[j].item()
-                    ov_x = (wi + wj) / 2 - abs(xi - xj)
-                    ov_y = (hi + hj) / 2 - abs(yi - yj)
+
+                    # Required gap between macro edges
+                    shared = macro_shared.get((min(i, j), max(i, j)), 0)
+                    gap = base_gap + gap_per_shared * min(shared, 10)
+
+                    # Check separation including gap
+                    min_sep_x = (wi + wj) / 2 + gap
+                    min_sep_y = (hi + hj) / 2 + gap
+                    ov_x = min_sep_x - abs(xi - xj)
+                    ov_y = min_sep_y - abs(yi - yj)
+
                     if ov_x > 0 and ov_y > 0:
                         any_ov = True
                         if ov_x <= ov_y:
@@ -427,9 +447,24 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
     y_max = all_y.max().item() + 15
     rm.init_blocked(cell_features, num_macros, y_min, y_max)
 
-    # Step 2: Place std cells by degree (most connected first)
+    # Step 2: Place std cells — spatially aware order
+    # For each std cell, find its "anchor" macro (most-connected macro).
+    # Sort by: anchor macro position (left to right), then by degree.
+    # This ensures cells fill gaps near their connected macros.
     std_cells = list(range(num_macros, N))
-    std_cells.sort(key=lambda c: len(neighbors.get(c, {})), reverse=True)
+
+    def placement_key(ci):
+        # Find most-connected macro
+        macro_nbrs = {n: neighbors[ci].get(n, 0) for n in neighbors.get(ci, {}) if n < num_macros}
+        if macro_nbrs:
+            anchor = max(macro_nbrs, key=macro_nbrs.get)
+            anchor_x = positions[anchor, 0].item()
+        else:
+            anchor_x = 0.0
+        degree = len(neighbors.get(ci, {}))
+        return (anchor_x, -degree)  # group by macro x, then highest degree first
+
+    std_cells.sort(key=placement_key)
 
     for ci in std_cells:
         w = widths[ci].item()
