@@ -399,8 +399,8 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
 
     # Push macros apart: minimum gap = base + extra per shared connection
     # Shared cells need room to sit between the macros
-    base_gap = 2.0  # minimum gap even with no shared cells
-    gap_per_shared = 1.0  # extra gap per shared std cell
+    base_gap = 0.5  # small minimum gap
+    gap_per_shared = 0.3  # modest extra gap per shared std cell
 
     if num_macros > 1:
         for _pass in range(300):
@@ -521,9 +521,9 @@ def swap_refine(cell_features, pin_features, edge_list, rm,
     pin_to_cell, neighbors, cell_edges = build_cell_graph(pin_features, edge_list)
 
     total_improvements = 0
+    swapped_pairs = set()  # prevent oscillation
 
     for iteration in range(max_iterations):
-        # Score cells by WL
         cell_scores = []
         for ci in range(num_macros, N):
             wl = cell_wl(ci, positions, pin_features, edge_list, pin_to_cell, cell_edges)
@@ -554,15 +554,48 @@ def swap_refine(cell_features, pin_features, edge_list, rm,
             target_x = nbr_x / cnt
             target_y = nbr_y / cnt
 
-            # Try cross-row move
-            best_improvement = 0.01  # threshold
+            best_improvement = 0.01
             best_move = None
 
+            # Move type A: within-row swap with adjacent cells
+            row_cells = rm.get_row_cells(cur_row)
+            ci_idx = row_cells.index(ci) if ci in row_cells else -1
+            if ci_idx >= 0:
+                for offset in [-1, 1, -2, 2]:
+                    j_idx = ci_idx + offset
+                    if not (0 <= j_idx < len(row_cells)):
+                        continue
+                    cj = row_cells[j_idx]
+                    if cj in moved or cj < num_macros:
+                        continue
+                    # Skip if already swapped this pair
+                    pair = (min(ci, cj), max(ci, cj))
+                    if pair in swapped_pairs:
+                        continue
+
+                    # Evaluate: WL of BOTH cells before and after swap
+                    wl_j_before = cell_wl(cj, positions, pin_features, edge_list,
+                                          pin_to_cell, cell_edges)
+                    xi, xj = positions[ci, 0].item(), positions[cj, 0].item()
+                    positions[ci, 0] = xj
+                    positions[cj, 0] = xi
+                    wl_i_after = cell_wl(ci, positions, pin_features, edge_list,
+                                         pin_to_cell, cell_edges)
+                    wl_j_after = cell_wl(cj, positions, pin_features, edge_list,
+                                         pin_to_cell, cell_edges)
+                    positions[ci, 0] = xi
+                    positions[cj, 0] = xj
+
+                    improvement = (cur_wl + wl_j_before) - (wl_i_after + wl_j_after)
+                    if improvement > best_improvement:
+                        best_improvement = improvement
+                        best_move = ("swap", cj)
+
+            # Move type B: cross-row move
             for ry in rm.get_row_y_values(target_y, radius=3):
                 if abs(ry - cur_row) < 0.01:
                     continue
 
-                # Get legal x (no macro overlap by construction)
                 x = rm.legal_x(ry, target_x, w)
 
                 old_x, old_y = positions[ci, 0].item(), positions[ci, 1].item()
@@ -579,15 +612,27 @@ def swap_refine(cell_features, pin_features, edge_list, rm,
 
             # Apply best move
             if best_move is not None:
-                _, new_x, new_ry = best_move
-                old_row = rm.cell_row[ci]
-                rm.remove_cell(ci)
-                # Compact old row (close the gap)
-                rm.compact_row(old_row, positions)
-                # Place in new row (compact resolves overlaps)
-                rm.place_cell(ci, new_x, new_ry, w, positions)
-                moved.add(ci)
-                iter_improvements += 1
+                if best_move[0] == "swap":
+                    cj = best_move[1]
+                    xi = positions[ci, 0].item()
+                    xj = positions[cj, 0].item()
+                    positions[ci, 0] = xj
+                    positions[cj, 0] = xi
+                    ry = rm.cell_row[ci]
+                    cells = rm.rows[ry]
+                    rm.rows[ry] = sorted(cells, key=lambda t: t[0])
+                    swapped_pairs.add((min(ci, cj), max(ci, cj)))
+                    moved.add(ci)
+                    moved.add(cj)
+                    iter_improvements += 1
+                else:
+                    _, new_x, new_ry = best_move
+                    old_row = rm.cell_row[ci]
+                    rm.remove_cell(ci)
+                    rm.compact_row(old_row, positions)
+                    rm.place_cell(ci, new_x, new_ry, w, positions)
+                    moved.add(ci)
+                    iter_improvements += 1
 
         total_improvements += iter_improvements
         if verbose:
