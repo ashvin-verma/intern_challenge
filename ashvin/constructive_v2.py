@@ -459,8 +459,8 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
                      widths[i].item(), heights[i].item())
 
     # ── Phase 1: Iterative barycentric averaging ──
-    # Each cell moves toward centroid of all its neighbors (macros + std).
-    # Like force-directed without repulsion. 20 iterations converges.
+    # Each cell moves toward centroid of all its neighbors.
+    # 20 iterations converges to connectivity-optimal positions (overlapping).
     std_cells = list(range(num_macros, N))
 
     for _iteration in range(20):
