@@ -56,6 +56,73 @@ def cell_wl(ci, positions, pin_features, edge_list, pin_to_cell, cell_edges):
 
 # ── Row structure ────────────────────────────────────────────────────
 
+def compute_blocked_intervals(cell_features, num_macros, row_centers, row_h, margin=1e-3):
+    """For each row, return sorted+merged (x_lo, x_hi) intervals blocked by macros."""
+    blocked = {r: [] for r in range(len(row_centers))}
+
+    for mi in range(num_macros):
+        mx = float(cell_features[mi, 2])
+        my = float(cell_features[mi, 3])
+        mw = float(cell_features[mi, 4])
+        mh = float(cell_features[mi, 5])
+
+        m_x_lo = mx - mw / 2 - margin
+        m_x_hi = mx + mw / 2 + margin
+        m_y_lo = my - mh / 2 - margin
+        m_y_hi = my + mh / 2 + margin
+
+        for r, ry in enumerate(row_centers):
+            row_lo = ry - row_h / 2
+            row_hi = ry + row_h / 2
+            if m_y_lo < row_hi and m_y_hi > row_lo:
+                blocked[r].append((m_x_lo, m_x_hi))
+
+    # Merge overlapping intervals per row
+    for r in blocked:
+        ivs = sorted(blocked[r])
+        merged = []
+        for lo, hi in ivs:
+            if merged and lo <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+            else:
+                merged.append((lo, hi))
+        blocked[r] = merged
+
+    return blocked
+
+
+def best_legal_x(target_x, cell_w, blocked_intervals, margin=1e-3):
+    """Find x closest to target_x where cell of width cell_w fits legally."""
+    half = cell_w / 2 + margin
+
+    # Expand macro intervals by cell half-width to get forbidden CENTER positions
+    forbidden = [(lo - half, hi + half) for (lo, hi) in blocked_intervals]
+
+    # Merge after expansion (adjacent macros may create impassable gaps)
+    forbidden.sort()
+    merged = []
+    for lo, hi in forbidden:
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+
+    def is_legal(x):
+        return all(x <= lo or x >= hi for (lo, hi) in merged)
+
+    if is_legal(target_x):
+        return target_x
+
+    # Candidates: just outside each forbidden boundary
+    candidates = []
+    for lo, hi in merged:
+        candidates.append(lo - 1e-6)
+        candidates.append(hi + 1e-6)
+
+    legal = [(abs(c - target_x), c) for c in candidates if is_legal(c)]
+    return min(legal)[1] if legal else target_x
+
+
 class RowManager:
     """Manages rows of cells with legal (non-overlapping) positions."""
 
@@ -64,9 +131,43 @@ class RowManager:
         self.rows = {}  # row_y -> sorted list of (left_edge, width, cell_idx)
         self.cell_row = {}  # cell_idx -> row_y
         self.macro_obstacles = []  # (x_min, y_min, x_max, y_max)
+        self.blocked = {}  # row_idx -> blocked intervals (set by init_blocked)
+        self.row_centers = []  # list of row y-values
+        self.row_y_to_idx = {}  # row_y -> index into row_centers
 
     def add_macro(self, ci, x, y, w, h):
         self.macro_obstacles.append((x - w/2, y - h/2, x + w/2, y + h/2))
+
+    def init_blocked(self, cell_features, num_macros, y_min, y_max):
+        """Precompute blocked intervals per row from macros."""
+        row_min = int(math.floor(y_min / self.row_height))
+        row_max = int(math.ceil(y_max / self.row_height))
+        self.row_centers = [r * self.row_height for r in range(row_min, row_max + 1)]
+        self.row_y_to_idx = {ry: i for i, ry in enumerate(self.row_centers)}
+        self.blocked = compute_blocked_intervals(
+            cell_features, num_macros, self.row_centers, self.row_height)
+
+    def legal_x(self, row_y, target_x, cell_w):
+        """Get nearest legal x for a cell in this row, avoiding macros."""
+        r_idx = self.row_y_to_idx.get(row_y)
+        if r_idx is not None:
+            return best_legal_x(target_x, cell_w, self.blocked.get(r_idx, []))
+
+        # Row not precomputed — compute blocked intervals on the fly
+        intervals = []
+        margin = 1e-3
+        for ox_min, oy_min, ox_max, oy_max in self.macro_obstacles:
+            if oy_min < row_y + self.row_height / 2 and oy_max > row_y - self.row_height / 2:
+                intervals.append((ox_min - margin, ox_max + margin))
+        # Merge
+        intervals.sort()
+        merged = []
+        for lo, hi in intervals:
+            if merged and lo <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+            else:
+                merged.append((lo, hi))
+        return best_legal_x(target_x, cell_w, merged)
 
     def get_row_y_values(self, y_center, radius=10):
         """Get available row y-values near y_center."""
@@ -236,51 +337,36 @@ class RowManager:
         return [ci for _, _, ci in self.rows.get(row_y, [])]
 
     def compact_row(self, row_y, positions, widths=None):
-        """Re-compact a row: resolve ALL overlaps (cell-cell AND cell-macro)."""
+        """Re-compact row: left-to-right sweep, skip macro blocked intervals."""
         cells = self.rows.get(row_y, [])
         if not cells:
             return
-        if len(cells) == 1:
-            ci = cells[0][2]
-            w = cells[0][1]
-            x = positions[ci, 0].item()
-            # Still need to check macro overlap for singletons
-            for _ in range(20):
-                if not self._macro_overlaps(x, row_y, w):
-                    break
-                # Find which macro we hit and jump past it
-                for ox_min, oy_min, ox_max, oy_max in self.macro_obstacles:
-                    h = self.row_height
-                    if x + w/2 > ox_min and x - w/2 < ox_max and \
-                       row_y + h/2 > oy_min and row_y - h/2 < oy_max:
-                        x = ox_max + w / 2 + 0.1
-                        break
-            positions[ci, 0] = x
-            positions[ci, 1] = row_y
-            self.rows[row_y] = [(x - w/2, w, ci)]
-            return
 
-        # Sort by current x
+        # Get blocked intervals for this row
+        r_idx = self.row_y_to_idx.get(row_y)
+        blocked = self.blocked.get(r_idx, []) if r_idx is not None else []
+
         cells.sort(key=lambda t: t[0])
-
-        # Left-to-right sweep
         new_cells = []
-        cursor = cells[0][0]  # start from leftmost edge
         for _, w, ci in cells:
-            x = max(cursor + w / 2, positions[ci, 0].item())
+            x = positions[ci, 0].item()
+            if new_cells:
+                prev_right = new_cells[-1][0] + new_cells[-1][1]
+                x = max(x, prev_right + w / 2)
 
-            # Push past macro obstacles — check repeatedly
+            # Skip over any blocked interval this cell center falls in
+            half = w / 2 + 1e-3
             for _ in range(20):
-                if not self._macro_overlaps(x, row_y, w):
-                    break
-                for ox_min, oy_min, ox_max, oy_max in self.macro_obstacles:
-                    h = self.row_height
-                    if x + w/2 > ox_min and x - w/2 < ox_max and \
-                       row_y + h/2 > oy_min and row_y - h/2 < oy_max:
-                        x = ox_max + w / 2 + 0.1
+                in_blocked = False
+                for blo, bhi in blocked:
+                    if blo - half < x < bhi + half:
+                        x = bhi + half + 1e-6
+                        in_blocked = True
                         break
+                if not in_blocked:
+                    break
 
-            # Ensure no overlap with previous cell
+            # Re-check previous cell after macro skip
             if new_cells:
                 prev_right = new_cells[-1][0] + new_cells[-1][1]
                 x = max(x, prev_right + w / 2)
@@ -288,7 +374,6 @@ class RowManager:
             positions[ci, 0] = x
             positions[ci, 1] = row_y
             new_cells.append((x - w / 2, w, ci))
-            cursor = x + w / 2
         self.rows[row_y] = new_cells
 
 
@@ -305,14 +390,42 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
 
     rm = RowManager(row_height=1.0)
 
-    # Step 1: Place macros — spread them apart using GD positions as hint
-    total_area = cell_features[:, 0].sum().item()
-    spread = (total_area ** 0.5) * 0.6
+    # Step 1: Legalize macros (push apart until no overlap)
+    if num_macros > 1:
+        for _pass in range(200):
+            any_ov = False
+            for i in range(num_macros):
+                for j in range(i + 1, num_macros):
+                    xi, yi = positions[i, 0].item(), positions[i, 1].item()
+                    xj, yj = positions[j, 0].item(), positions[j, 1].item()
+                    wi, hi = widths[i].item(), heights[i].item()
+                    wj, hj = widths[j].item(), heights[j].item()
+                    ov_x = (wi + wj) / 2 - abs(xi - xj)
+                    ov_y = (hi + hj) / 2 - abs(yi - yj)
+                    if ov_x > 0 and ov_y > 0:
+                        any_ov = True
+                        if ov_x <= ov_y:
+                            s = ov_x / 2 + 0.1
+                            sign = 1.0 if xi >= xj else -1.0
+                            positions[i, 0] += sign * s
+                            positions[j, 0] -= sign * s
+                        else:
+                            s = ov_y / 2 + 0.1
+                            sign = 1.0 if yi >= yj else -1.0
+                            positions[i, 1] += sign * s
+                            positions[j, 1] -= sign * s
+            if not any_ov:
+                break
 
     for i in range(num_macros):
-        # Keep GD macro positions (already legalized by macro push)
         rm.add_macro(i, positions[i, 0].item(), positions[i, 1].item(),
                      widths[i].item(), heights[i].item())
+
+    # Precompute blocked intervals per row (AFTER macro legalization)
+    all_y = positions[num_macros:, 1]
+    y_min = all_y.min().item() - 15
+    y_max = all_y.max().item() + 15
+    rm.init_blocked(cell_features, num_macros, y_min, y_max)
 
     # Step 2: Place std cells by degree (most connected first)
     std_cells = list(range(num_macros, N))
@@ -328,41 +441,28 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
             target_x = sum(positions[n, 0].item() for n in placed_nbrs) / len(placed_nbrs)
             target_y = sum(positions[n, 1].item() for n in placed_nbrs) / len(placed_nbrs)
         else:
-            # No placed neighbors — use GD position
             target_x = positions[ci, 0].item()
             target_y = positions[ci, 1].item()
 
         # Try nearby rows, pick the one with best WL
-        h = heights[ci].item()
         candidate_rows = rm.get_row_y_values(target_y, radius=5)
         best_wl = float("inf")
         best_x, best_ry = target_x, round(target_y)
 
         for ry in candidate_rows:
-            x = rm.find_insertion_x(ry, target_x, w)
-
-            # Check macro overlap and project to boundary if needed
-            macro_candidates = rm.push_outside_macros(x, ry, w, h)
-            for cx, cy in macro_candidates:
-                # Snap cy back to row (we can't move between rows here)
-                cx_final = cx
-                wl = 0.0
-                for n in placed_nbrs:
-                    nx = positions[n, 0].item()
-                    ny = positions[n, 1].item()
-                    wl += abs(cx_final - nx) + abs(ry - ny)
-                if wl < best_wl:
-                    best_wl = wl
-                    best_x = cx_final
-                    best_ry = ry
+            # Get nearest legal x (guaranteed no macro overlap)
+            x = rm.legal_x(ry, target_x, w)
+            wl = 0.0
+            for n in placed_nbrs:
+                wl += abs(x - positions[n, 0].item()) + abs(ry - positions[n, 1].item())
+            if wl < best_wl:
+                best_wl = wl
+                best_x = x
+                best_ry = ry
 
         positions[ci, 0] = best_x
         positions[ci, 1] = best_ry
         rm.place_cell(ci, best_x, best_ry, w, positions)
-
-    # Final pass: compact ALL rows to guarantee zero macro overlap
-    for ry in list(rm.rows.keys()):
-        rm.compact_row(ry, positions)
 
     cell_features[:, 2:4] = positions
     return rm
@@ -427,24 +527,20 @@ def swap_refine(cell_features, pin_features, edge_list, rm,
                 if abs(ry - cur_row) < 0.01:
                     continue
 
-                x = rm.find_insertion_x(ry, target_x, w)
+                # Get legal x (no macro overlap by construction)
+                x = rm.legal_x(ry, target_x, w)
 
-                # Check macro overlap, project if needed
-                h = cell_features[ci, 5].item()
-                macro_cands = rm.push_outside_macros(x, ry, w, h)
+                old_x, old_y = positions[ci, 0].item(), positions[ci, 1].item()
+                positions[ci, 0] = x
+                positions[ci, 1] = ry
+                new_wl = cell_wl(ci, positions, pin_features, edge_list, pin_to_cell, cell_edges)
+                positions[ci, 0] = old_x
+                positions[ci, 1] = old_y
 
-                for cx, _ in macro_cands:
-                    old_x, old_y = positions[ci, 0].item(), positions[ci, 1].item()
-                    positions[ci, 0] = cx
-                    positions[ci, 1] = ry
-                    new_wl = cell_wl(ci, positions, pin_features, edge_list, pin_to_cell, cell_edges)
-                    positions[ci, 0] = old_x
-                    positions[ci, 1] = old_y
-
-                    improvement = cur_wl - new_wl
-                    if improvement > best_improvement:
-                        best_improvement = improvement
-                        best_move = ("cross", cx, ry)
+                improvement = cur_wl - new_wl
+                if improvement > best_improvement:
+                    best_improvement = improvement
+                    best_move = ("cross", x, ry)
 
             # Apply best move
             if best_move is not None:
