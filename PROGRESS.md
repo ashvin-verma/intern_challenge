@@ -443,6 +443,25 @@ Different from islands (which grow greedily) — this is degree-centric.
 cluster cells too tightly, making overlap resolution harder. Init is NOT the bottleneck.
 **Legalization is the bottleneck.** Moving to fix legalization next.
 
+### WL-aware Abacus legalization
+Rewrote Abacus to optimize WL instead of displacement. Uses barycentric
+target of neighbors as candidate position during cluster merge DP.
+
+**Raw legalization comparison (no pipeline):**
+WL-aware Abacus wins 7/9 tests vs greedy, by 1-4% each. Only test 3 loses.
+
+**But in full pipeline: WORSE.** The pipeline passes (anchor GD, barycentric,
+scatter) were tuned for greedy output. Abacus produces different positions →
+pipeline converges to different (worse) local minima. Tried:
+- Both legalizers per call (pick best): unstable, slow
+- Abacus first call only: same result
+- Abacus as sole legalizer: worse on 7/9 tests
+
+**Conclusion:** The legalizer can't be improved in isolation. The entire
+GD→legalize→refine pipeline is co-adapted. Changing one component without
+re-adapting the others causes regression. This is the fundamental ceiling
+of the bolt-on approach.
+
 **Plots:** `ashvin/plots/run24_multistart/`, `ashvin/plots/legalize_compare/`
 
 **What didn't work (new):**
