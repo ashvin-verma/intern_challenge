@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
+import torch.optim as optim
 
 
 # ── Adjacency ────────────────────────────────────────────────────────
@@ -583,6 +584,137 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
     return rm
 
 
+def construct_placement_from_positions(cell_features, pin_features, edge_list, num_macros):
+    """Phase 2 only: take existing positions (e.g. from GD) and spread into legal rows.
+
+    Skips phase 1 (averaging). Uses the positions already in cell_features as targets.
+    """
+    N = cell_features.shape[0]
+    positions = cell_features[:, 2:4].detach()
+    widths = cell_features[:, 4].detach()
+    heights = cell_features[:, 5].detach()
+
+    pin_to_cell_local, neighbors, cell_edges_local = build_cell_graph(pin_features, edge_list)
+
+    rm = RowManager(row_height=1.0)
+
+    # Legalize macros
+    if num_macros > 1:
+        for _pass in range(300):
+            any_ov = False
+            for i in range(num_macros):
+                for j in range(i + 1, num_macros):
+                    xi, yi = positions[i, 0].item(), positions[i, 1].item()
+                    xj, yj = positions[j, 0].item(), positions[j, 1].item()
+                    wi, hi = widths[i].item(), heights[i].item()
+                    wj, hj = widths[j].item(), heights[j].item()
+                    ov_x = (wi + wj) / 2 - abs(xi - xj)
+                    ov_y = (hi + hj) / 2 - abs(yi - yj)
+                    if ov_x > 0 and ov_y > 0:
+                        any_ov = True
+                        if ov_x <= ov_y:
+                            s = ov_x / 2 + 0.1
+                            sign = 1.0 if xi >= xj else -1.0
+                            positions[i, 0] += sign * s
+                            positions[j, 0] -= sign * s
+                        else:
+                            s = ov_y / 2 + 0.1
+                            sign = 1.0 if yi >= yj else -1.0
+                            positions[i, 1] += sign * s
+                            positions[j, 1] -= sign * s
+            if not any_ov:
+                break
+
+    for i in range(num_macros):
+        rm.add_macro(i, positions[i, 0].item(), positions[i, 1].item(),
+                     widths[i].item(), heights[i].item())
+
+    # Precompute blocked intervals
+    y_min = positions[:, 1].min().item() - 15
+    y_max = positions[:, 1].max().item() + 15
+    rm.init_blocked(cell_features, num_macros, y_min, y_max)
+
+    # Save ideal positions
+    ideal_x = positions[num_macros:, 0].clone()
+    ideal_y = positions[num_macros:, 1].clone()
+
+    std_cells = list(range(num_macros, N))
+
+    # Assign to nearest legal row at legal x
+    for ci in std_cells:
+        w = widths[ci].item()
+        ty = positions[ci, 1].item()
+        ry = round(ty / rm.row_height) * rm.row_height
+        tx = positions[ci, 0].item()
+        x = rm.legal_x(ry, tx, w)
+        positions[ci, 0] = x
+        positions[ci, 1] = ry
+        rm.place_cell(ci, x, ry, w, positions, compact=False)
+
+    # WL-aware overlap resolution
+    for _sweep in range(5):
+        any_moved = False
+        for ry in list(rm.rows.keys()):
+            cells = rm.rows.get(ry, [])
+            if len(cells) <= 1:
+                continue
+            cells.sort(key=lambda t: t[0])
+
+            i = 0
+            while i < len(cells) - 1:
+                left_i, w_i, ci = cells[i]
+                left_j, w_j, cj = cells[i + 1]
+                right_i = left_i + w_i
+
+                if right_i > left_j + 1e-6:
+                    overlap_amount = right_i - left_j
+                    wl_i = cell_wl(ci, positions, pin_features, edge_list,
+                                   pin_to_cell_local, cell_edges_local)
+                    wl_j = cell_wl(cj, positions, pin_features, edge_list,
+                                   pin_to_cell_local, cell_edges_local)
+
+                    moved_to_other_row = False
+                    mover = cj if wl_j <= wl_i else ci
+                    mover_w = widths[mover].item()
+
+                    for alt_ry in [ry - 1.0, ry + 1.0]:
+                        alt_x = rm.legal_x(alt_ry, positions[mover, 0].item(), mover_w)
+                        alt_cells = rm.rows.get(alt_ry, [])
+                        fits = True
+                        for al, aw, _ in alt_cells:
+                            if abs(alt_x - (al + aw/2)) < (mover_w + aw) / 2:
+                                fits = False
+                                break
+                        if fits:
+                            rm.remove_cell(mover)
+                            positions[mover, 0] = alt_x
+                            positions[mover, 1] = alt_ry
+                            rm.place_cell(mover, alt_x, alt_ry, mover_w, positions, compact=False)
+                            moved_to_other_row = True
+                            any_moved = True
+                            cells = rm.rows.get(ry, [])
+                            cells.sort(key=lambda t: t[0])
+                            break
+
+                    if not moved_to_other_row:
+                        new_x = right_i + w_j / 2
+                        new_x = rm.legal_x(ry, new_x, w_j)
+                        positions[cj, 0] = new_x
+                        cells[i + 1] = (new_x - w_j / 2, w_j, cj)
+                        any_moved = True
+                i += 1
+            rm.rows[ry] = cells
+        if not any_moved:
+            break
+
+    # Final bidirectional compact
+    for ry in list(rm.rows.keys()):
+        rm.compact_row(ry, positions)
+
+    cell_features[:, 2:4] = positions
+    return rm
+
+
 # ── Swap refinement ─────────────────────────────────────────────────
 
 def swap_refine(cell_features, pin_features, edge_list, rm,
@@ -730,7 +862,9 @@ def solve_constructive_v2(cell_features, pin_features, edge_list,
                           config=None, verbose=False):
     """Constructive solver: place legally, then swap to optimize.
 
-    No GD. No legalization. Always legal.
+    Two modes:
+    - Default: iterative averaging → WL-aware spreading → swap engine
+    - Hybrid (use_gd_init=True): GD positions → WL-aware spreading → swap engine
     """
     start_time = time.perf_counter()
     cell_features = cell_features.clone()
@@ -738,11 +872,62 @@ def solve_constructive_v2(cell_features, pin_features, edge_list,
     initial_cell_features = cell_features.clone()
     num_macros = (cell_features[:, 5] > 1.5).sum().item()
 
-    if verbose:
-        print(f"  Constructive v2: N={N}, macros={num_macros}")
+    use_gd_init = config.get("use_gd_init", False) if config else False
 
-    # Step 1-2: Construct legal placement
-    rm = construct_placement(cell_features, pin_features, edge_list, num_macros)
+    if verbose:
+        print(f"  Constructive v2: N={N}, macros={num_macros}"
+              f"{' (GD init)' if use_gd_init else ''}")
+
+    if use_gd_init:
+        # Use GD to get optimal overlapping positions, then spread
+        from placement import wirelength_attraction_loss
+        from ashvin.overlap import scalable_overlap_loss, _pair_cache
+        from ashvin.density import density_loss as d_loss_fn
+
+        gd_config = config or {}
+        gd_epochs = gd_config.get("epochs", 500)
+        gd_lr = gd_config.get("lr", 0.001)
+        lambda_wl_gd = gd_config.get("lambda_wl", 7.5)
+        lambda_ov_start = gd_config.get("lambda_overlap_start", 2.65)
+        lambda_ov_end = gd_config.get("lambda_overlap_end", 140.0)
+        beta_start = gd_config.get("beta_start", 0.43)
+        beta_end = gd_config.get("beta_end", 3.51)
+        lambda_density = gd_config.get("lambda_density", 2.6)
+        inflate = gd_config.get("inflate", 1.08)
+
+        if inflate > 1.0:
+            cell_features[:, 4] *= inflate
+            cell_features[:, 5] *= inflate
+
+        pos = cell_features[:, 2:4].clone().detach().requires_grad_(True)
+        optimizer_gd = optim.Adam([pos], lr=gd_lr)
+        _pair_cache["pairs"] = None
+        _pair_cache["call_count"] = 0
+
+        for ep in range(gd_epochs):
+            optimizer_gd.zero_grad()
+            cf_cur = cell_features.clone()
+            cf_cur[:, 2:4] = pos
+            p = ep / max(gd_epochs - 1, 1)
+            beta = beta_start + (beta_end - beta_start) * p
+            lam_ov = lambda_ov_start + (lambda_ov_end - lambda_ov_start) * p
+            wl = wirelength_attraction_loss(cf_cur, pin_features, edge_list)
+            ov = scalable_overlap_loss(cf_cur, beta=beta)
+            dl = d_loss_fn(cf_cur) if lambda_density > 0 else torch.tensor(0.0)
+            (lambda_wl_gd * wl + lam_ov * ov + lambda_density * dl).backward()
+            torch.nn.utils.clip_grad_norm_([pos], 5.0)
+            optimizer_gd.step()
+
+        cell_features[:, 2:4] = pos.detach()
+        if inflate > 1.0:
+            cell_features[:, 4] = initial_cell_features[:, 4]
+            cell_features[:, 5] = initial_cell_features[:, 5]
+
+        # Now spread using constructive phase 2 instead of greedy legalization
+        rm = construct_placement_from_positions(
+            cell_features, pin_features, edge_list, num_macros)
+    else:
+        rm = construct_placement(cell_features, pin_features, edge_list, num_macros)
 
     if verbose:
         from placement import calculate_normalized_metrics
