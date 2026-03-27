@@ -460,8 +460,6 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
                      widths[i].item(), heights[i].item())
 
     # ── Phase 1: Iterative barycentric averaging ──
-    # Each cell moves toward centroid of all its neighbors.
-    # 20 iterations converges to connectivity-optimal positions (overlapping).
     std_cells = list(range(num_macros, N))
 
     for _iteration in range(20):
@@ -479,96 +477,56 @@ def construct_placement(cell_features, pin_features, edge_list, num_macros):
                 positions[ci, 0] = 0.3 * positions[ci, 0].item() + 0.7 * cx
                 positions[ci, 1] = 0.3 * positions[ci, 1].item() + 0.7 * cy
 
-    # ── Phase 2: Assign to rows, redistribute overloaded, then compact ──
+    # ── Phase 2: Load-balanced row assignment + compact ──
     y_min = positions[:, 1].min().item() - 15
     y_max = positions[:, 1].max().item() + 15
     rm.init_blocked(cell_features, num_macros, y_min, y_max)
 
-    # Step 2a: Assign each std cell to nearest row
-    for ci in std_cells:
+    # Compute how many rows we need
+    total_std_width = sum(widths[ci].item() for ci in std_cells)
+    # Estimate usable width per row (total area / sqrt gives rough extent)
+    total_area = cell_features[:, 0].sum().item()
+    usable_width_per_row = (total_area ** 0.5) * 0.8
+    min_rows_needed = max(1, int(total_std_width / usable_width_per_row) + 1)
+
+    # Sort cells by y-position, then assign round-robin to spread across rows
+    sorted_by_y = sorted(std_cells, key=lambda ci: positions[ci, 1].item())
+
+    # Determine row centers: spread around the centroid of phase 1 positions
+    centroid_y = sum(positions[ci, 1].item() for ci in std_cells) / len(std_cells)
+    num_rows = max(min_rows_needed, len(sorted_by_y) // 8)  # at least N/8 rows
+    row_centers = [centroid_y + (r - num_rows // 2) * rm.row_height
+                   for r in range(num_rows)]
+    # Snap to row grid
+    row_centers = sorted(set(round(ry / rm.row_height) * rm.row_height for ry in row_centers))
+
+    # Assign cells to rows: each cell goes to nearest row that isn't too full
+    row_load = {ry: 0.0 for ry in row_centers}
+    max_load = total_std_width / len(row_centers) * 1.5  # 50% over average is max
+
+    for ci in sorted_by_y:
         w = widths[ci].item()
         ty = positions[ci, 1].item()
-        ry = round(ty / rm.row_height) * rm.row_height
         tx = positions[ci, 0].item()
-        x = rm.legal_x(ry, tx, w)
+
+        # Find best row: nearest that has capacity
+        best_ry = row_centers[0]
+        best_score = float("inf")
+        for ry in row_centers:
+            if row_load.get(ry, 0) + w > max_load:
+                continue
+            score = abs(ry - ty)  # prefer nearest row
+            if score < best_score:
+                best_score = score
+                best_ry = ry
+
+        x = rm.legal_x(best_ry, tx, w)
         positions[ci, 0] = x
-        positions[ci, 1] = ry
-        rm.place_cell(ci, x, ry, w, positions, compact=False)
+        positions[ci, 1] = best_ry
+        rm.place_cell(ci, x, best_ry, w, positions, compact=False)
+        row_load[best_ry] = row_load.get(best_ry, 0) + w
 
-    # Step 2b: Redistribute overloaded rows
-    # Compute target width per row (total cell width / num rows used)
-    total_std_width = sum(widths[ci].item() for ci in std_cells)
-    used_rows = [ry for ry in rm.rows if len(rm.rows[ry]) > 0]
-    if used_rows:
-        target_width = total_std_width / max(len(used_rows), 1) * 1.2  # 20% headroom
-
-        # Iterate: move cells from overloaded rows to adjacent underloaded rows
-        for _pass in range(10):
-            moved_any = False
-            for ry in sorted(rm.rows.keys()):
-                cells = rm.rows.get(ry, [])
-                row_width = sum(w for _, w, _ in cells)
-                if row_width <= target_width:
-                    continue
-
-                # Row is overloaded — move rightmost cells to adjacent rows
-                cells.sort(key=lambda t: t[0])
-                while len(cells) > 1:
-                    row_width = sum(w for _, w, _ in cells)
-                    if row_width <= target_width:
-                        break
-
-                    # Pick the cell furthest from its ideal x in this row
-                    # (it benefits most from moving)
-                    worst_idx = len(cells) - 1  # default: rightmost
-                    worst_displacement = 0
-                    for k, (left, w, ci) in enumerate(cells):
-                        if ci < num_macros:
-                            continue
-                        ideal = positions[ci, 0].item()  # already set to legal_x
-                        # Check how far this cell was pushed by compaction
-                        disp = abs((left + w/2) - ideal)
-                        if disp > worst_displacement:
-                            worst_displacement = disp
-                            worst_idx = k
-
-                    _, w_move, ci_move = cells[worst_idx]
-                    if ci_move < num_macros:
-                        break
-
-                    # Try adjacent rows
-                    best_ry = None
-                    best_x = None
-                    best_dist = float("inf")
-                    target_x = positions[ci_move, 0].item()
-
-                    for alt_ry in [ry - 1.0, ry + 1.0, ry - 2.0, ry + 2.0]:
-                        alt_cells = rm.rows.get(alt_ry, [])
-                        alt_width = sum(w for _, w, _ in alt_cells)
-                        if alt_width + w_move > target_width * 1.5:
-                            continue  # don't overload the target row
-                        alt_x = rm.legal_x(alt_ry, target_x, w_move)
-                        dist = abs(alt_ry - ry) + abs(alt_x - target_x) * 0.1
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_ry = alt_ry
-                            best_x = alt_x
-
-                    if best_ry is not None:
-                        rm.remove_cell(ci_move)
-                        positions[ci_move, 0] = best_x
-                        positions[ci_move, 1] = best_ry
-                        rm.place_cell(ci_move, best_x, best_ry, w_move, positions,
-                                      compact=False)
-                        cells = rm.rows.get(ry, [])
-                        moved_any = True
-                    else:
-                        break
-
-            if not moved_any:
-                break
-
-    # Step 2c: Within-row compaction
+    # Within-row compaction
     for ry in list(rm.rows.keys()):
         rm.compact_row(ry, positions)
 
