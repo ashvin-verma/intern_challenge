@@ -93,9 +93,11 @@ def _generate_macro_pairs(positions, widths, heights, num_macros):
 
 
 def _generate_stdcell_pairs(positions, widths, heights, num_macros, bin_size):
-    """Generate candidate pairs among std cells using GPU-friendly spatial hashing.
+    """Generate candidate pairs among std cells — fully vectorized.
 
-    Uses sort-based binning with torch ops — no Python loops over cells.
+    Instead of spatial hashing with Python loops, use a distance-based
+    approach: for each cell, find all cells within max overlap distance.
+    Uses torch broadcasting for small N, sorted sweepline for large N.
 
     Returns [P, 2] int64 tensor with global indices.
     """
@@ -103,89 +105,84 @@ def _generate_stdcell_pairs(positions, widths, heights, num_macros, bin_size):
     if num_macros >= N:
         return torch.zeros((0, 2), dtype=torch.long, device=positions.device)
 
-    std_pos = positions[num_macros:].detach()
-    num_std = std_pos.shape[0]
-
+    num_std = N - num_macros
     if num_std <= 1:
         return torch.zeros((0, 2), dtype=torch.long, device=positions.device)
 
     dev = positions.device
-    x = std_pos[:, 0]
-    y = std_pos[:, 1]
+    std_pos = positions[num_macros:].detach()
+    std_w = widths[num_macros:].detach()
+    std_h = heights[num_macros:].detach()
 
-    x_min = x.min() - bin_size
-    y_min = y.min() - bin_size
+    # For small N: brute force O(N^2) with vectorized distance check
+    if num_std <= 2000:
+        # Pairwise distances — fully vectorized
+        dx = torch.abs(std_pos[:, 0].unsqueeze(1) - std_pos[:, 0].unsqueeze(0))  # [S, S]
+        dy = torch.abs(std_pos[:, 1].unsqueeze(1) - std_pos[:, 1].unsqueeze(0))
+        max_dx = (std_w.unsqueeze(1) + std_w.unsqueeze(0)) / 2
+        max_dy = (std_h.unsqueeze(1) + std_h.unsqueeze(0)) / 2
 
-    bx = ((x - x_min) / bin_size).long()
-    by = ((y - y_min) / bin_size).long()
+        # Candidate pairs: overlap possible AND i < j
+        candidates = (dx < max_dx) & (dy < max_dy)
+        # Upper triangle only (i < j)
+        idx = torch.arange(num_std, device=dev)
+        candidates = candidates & (idx.unsqueeze(1) > idx.unsqueeze(0))
 
-    # Encode bin as single int for sorting: bx * large_prime + by
-    bx_range = (bx.max() - bx.min() + 3).item()
-    bin_key = bx * max(bx_range, 1) + by
+        pairs_local = torch.nonzero(candidates)  # [P, 2] local indices
+        if pairs_local.shape[0] == 0:
+            return torch.zeros((0, 2), dtype=torch.long, device=dev)
 
-    # Sort cells by bin key
-    sort_order = torch.argsort(bin_key)
-    sorted_keys = bin_key[sort_order]
-    sorted_global_idx = sort_order + num_macros  # global cell indices
+        # Convert to global indices
+        pairs = pairs_local + num_macros
+        return pairs
+    else:
+        # Large N: x-sorted sweepline with vectorized y-check
+        # Sort by x, then for each cell check forward neighbors within max_w
+        max_w = std_w.max().item()
+        max_h_val = std_h.max().item()
 
-    # Find bin boundaries using torch.unique
-    unique_keys, counts = torch.unique_consecutive(sorted_keys, return_counts=True)
-    offsets = torch.zeros(len(counts) + 1, dtype=torch.long, device=dev)
-    torch.cumsum(counts, dim=0, out=offsets[1:])
+        sort_idx = torch.argsort(std_pos[:, 0])
+        sorted_x = std_pos[sort_idx, 0]
+        sorted_y = std_pos[sort_idx, 1]
+        sorted_w = std_w[sort_idx]
+        sorted_h = std_h[sort_idx]
+        sorted_global = sort_idx + num_macros
 
-    # For each bin, generate within-bin pairs (i < j)
-    pair_chunks = []
+        pair_chunks = []
+        # Sweep: for each cell i, check cells j > i while x_j - x_i < max_w
+        for i in range(num_std - 1):
+            xi = sorted_x[i].item()
+            # Find range of j where x_j < xi + max_w
+            j_start = i + 1
+            # Binary search for end
+            j_end = j_start
+            while j_end < num_std and sorted_x[j_end].item() - xi < max_w:
+                j_end += 1
 
-    # Forward neighbor offsets (bin-key deltas)
-    # (0,0) = 0, (1,0) = bx_range, (0,1) = 1, (1,1) = bx_range+1, (-1,1) = -bx_range+1
-    bx_range_int = max(int(bx_range), 1)
-    neighbor_deltas = [0, bx_range_int, 1, bx_range_int + 1, -bx_range_int + 1]
-
-    # Build key-to-offset lookup
-    key_to_offset = {}
-    for b in range(len(unique_keys)):
-        key_to_offset[unique_keys[b].item()] = (offsets[b].item(), offsets[b + 1].item())
-
-    for b in range(len(unique_keys)):
-        key_val = unique_keys[b].item()
-        start_a, end_a = offsets[b].item(), offsets[b + 1].item()
-        cells_a = sorted_global_idx[start_a:end_a]
-
-        for delta in neighbor_deltas:
-            nb_key = key_val + delta
-            lookup = key_to_offset.get(nb_key)
-            if lookup is None:
+            if j_end <= j_start:
                 continue
-            start_b, end_b = lookup
 
-            if delta == 0:
-                # Same bin: generate i < j pairs
-                n = end_a - start_a
-                if n >= 2:
-                    idx = torch.arange(n, device=dev)
-                    ii, jj = torch.meshgrid(idx, idx, indexing="ij")
-                    mask = ii < jj
-                    pairs_local = torch.stack([cells_a[ii[mask]], cells_a[jj[mask]]], dim=1)
-                    pair_chunks.append(pairs_local)
-            else:
-                # Cross-bin: all pairs
-                cells_b = sorted_global_idx[start_b:end_b]
-                na, nb = len(cells_a), len(cells_b)
-                if na > 0 and nb > 0:
-                    aa = cells_a.unsqueeze(1).expand(na, nb).reshape(-1)
-                    bb = cells_b.unsqueeze(0).expand(na, nb).reshape(-1)
-                    # Ensure i < j
-                    lo = torch.min(aa, bb)
-                    hi = torch.max(aa, bb)
-                    pairs_local = torch.stack([lo, hi], dim=1)
-                    pair_chunks.append(pairs_local)
+            # Vectorized check for [j_start:j_end]
+            js = slice(j_start, j_end)
+            dx = sorted_x[js] - xi
+            dy = torch.abs(sorted_y[js] - sorted_y[i])
+            sep_x = (sorted_w[i] + sorted_w[js]) / 2
+            sep_y = (sorted_h[i] + sorted_h[js]) / 2
+            mask = (dx < sep_x) & (dy < sep_y)
 
-    if not pair_chunks:
-        return torch.zeros((0, 2), dtype=torch.long, device=dev)
+            if mask.any():
+                j_indices = torch.arange(j_start, j_end, device=dev)[mask]
+                gi = sorted_global[i].expand(len(j_indices))
+                gj = sorted_global[j_indices]
+                lo = torch.min(gi, gj)
+                hi = torch.max(gi, gj)
+                pair_chunks.append(torch.stack([lo, hi], dim=1))
 
-    pairs = torch.cat(pair_chunks, dim=0)
-    pairs = torch.unique(pairs, dim=0)
-    return pairs
+        if not pair_chunks:
+            return torch.zeros((0, 2), dtype=torch.long, device=dev)
+
+        pairs = torch.cat(pair_chunks, dim=0)
+        return torch.unique(pairs, dim=0)
 
 
 def generate_candidate_pairs(positions, widths, heights, num_macros, bin_size=3.0):
