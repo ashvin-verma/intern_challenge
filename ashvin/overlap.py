@@ -93,9 +93,9 @@ def _generate_macro_pairs(positions, widths, heights, num_macros):
 
 
 def _generate_stdcell_pairs(positions, widths, heights, num_macros, bin_size):
-    """Generate candidate pairs among std cells using spatial hashing.
+    """Generate candidate pairs among std cells using GPU-friendly spatial hashing.
 
-    Uses forward-neighbor pattern to avoid double-counting.
+    Uses sort-based binning with torch ops — no Python loops over cells.
 
     Returns [P, 2] int64 tensor with global indices.
     """
@@ -109,49 +109,81 @@ def _generate_stdcell_pairs(positions, widths, heights, num_macros, bin_size):
     if num_std <= 1:
         return torch.zeros((0, 2), dtype=torch.long, device=positions.device)
 
+    dev = positions.device
     x = std_pos[:, 0]
     y = std_pos[:, 1]
 
-    x_min = x.min().item() - bin_size
-    y_min = y.min().item() - bin_size
+    x_min = x.min() - bin_size
+    y_min = y.min() - bin_size
 
     bx = ((x - x_min) / bin_size).long()
     by = ((y - y_min) / bin_size).long()
 
-    # Build bin -> cell list mapping
-    bin_to_cells = defaultdict(list)
-    bx_list = bx.tolist()
-    by_list = by.tolist()
-    for i in range(num_std):
-        bin_to_cells[(bx_list[i], by_list[i])].append(i + num_macros)
+    # Encode bin as single int for sorting: bx * large_prime + by
+    bx_range = (bx.max() - bx.min() + 3).item()
+    bin_key = bx * max(bx_range, 1) + by
 
-    # Forward-neighbor pattern: covers all 9 neighbors without double-counting
-    forward_offsets = [(0, 0), (1, 0), (1, 1), (0, 1), (-1, 1)]
+    # Sort cells by bin key
+    sort_order = torch.argsort(bin_key)
+    sorted_keys = bin_key[sort_order]
+    sorted_global_idx = sort_order + num_macros  # global cell indices
 
-    pair_list = []
-    for (bx_val, by_val), cells in bin_to_cells.items():
-        for dx, dy in forward_offsets:
-            nbx, nby = bx_val + dx, by_val + dy
+    # Find bin boundaries using torch.unique
+    unique_keys, counts = torch.unique_consecutive(sorted_keys, return_counts=True)
+    offsets = torch.zeros(len(counts) + 1, dtype=torch.long, device=dev)
+    torch.cumsum(counts, dim=0, out=offsets[1:])
 
-            if dx == 0 and dy == 0:
-                # Same bin: all i<j pairs within
-                for a_idx in range(len(cells)):
-                    for b_idx in range(a_idx + 1, len(cells)):
-                        pair_list.append((cells[a_idx], cells[b_idx]))
+    # For each bin, generate within-bin pairs (i < j)
+    pair_chunks = []
+
+    # Forward neighbor offsets (bin-key deltas)
+    # (0,0) = 0, (1,0) = bx_range, (0,1) = 1, (1,1) = bx_range+1, (-1,1) = -bx_range+1
+    bx_range_int = max(int(bx_range), 1)
+    neighbor_deltas = [0, bx_range_int, 1, bx_range_int + 1, -bx_range_int + 1]
+
+    # Build key-to-offset lookup
+    key_to_offset = {}
+    for b in range(len(unique_keys)):
+        key_to_offset[unique_keys[b].item()] = (offsets[b].item(), offsets[b + 1].item())
+
+    for b in range(len(unique_keys)):
+        key_val = unique_keys[b].item()
+        start_a, end_a = offsets[b].item(), offsets[b + 1].item()
+        cells_a = sorted_global_idx[start_a:end_a]
+
+        for delta in neighbor_deltas:
+            nb_key = key_val + delta
+            lookup = key_to_offset.get(nb_key)
+            if lookup is None:
+                continue
+            start_b, end_b = lookup
+
+            if delta == 0:
+                # Same bin: generate i < j pairs
+                n = end_a - start_a
+                if n >= 2:
+                    idx = torch.arange(n, device=dev)
+                    ii, jj = torch.meshgrid(idx, idx, indexing="ij")
+                    mask = ii < jj
+                    pairs_local = torch.stack([cells_a[ii[mask]], cells_a[jj[mask]]], dim=1)
+                    pair_chunks.append(pairs_local)
             else:
-                neighbor_cells = bin_to_cells.get((nbx, nby))
-                if neighbor_cells is None:
-                    continue
-                for a in cells:
-                    for b in neighbor_cells:
-                        i, j = (a, b) if a < b else (b, a)
-                        pair_list.append((i, j))
+                # Cross-bin: all pairs
+                cells_b = sorted_global_idx[start_b:end_b]
+                na, nb = len(cells_a), len(cells_b)
+                if na > 0 and nb > 0:
+                    aa = cells_a.unsqueeze(1).expand(na, nb).reshape(-1)
+                    bb = cells_b.unsqueeze(0).expand(na, nb).reshape(-1)
+                    # Ensure i < j
+                    lo = torch.min(aa, bb)
+                    hi = torch.max(aa, bb)
+                    pairs_local = torch.stack([lo, hi], dim=1)
+                    pair_chunks.append(pairs_local)
 
-    if not pair_list:
-        return torch.zeros((0, 2), dtype=torch.long, device=positions.device)
+    if not pair_chunks:
+        return torch.zeros((0, 2), dtype=torch.long, device=dev)
 
-    pairs = torch.tensor(pair_list, dtype=torch.long, device=positions.device)
-    # Deduplicate (forward pattern should be clean, but safety for edge cases)
+    pairs = torch.cat(pair_chunks, dim=0)
     pairs = torch.unique(pairs, dim=0)
     return pairs
 
