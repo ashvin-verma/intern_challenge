@@ -489,6 +489,11 @@ Runtime is fast (3-42s, vs 30-300s for GD pipeline).
 with zero GD overhead. The swap engine needs more iterations and better moves
 to match GD on larger tests. This IS the right architecture — needs refinement.
 
+### GPU-optimized overlap pair generation
+Replaced Python defaultdict + nested loops with torch sort-based binning.
+Speedup: 1.3-2.5x on all tests. T6: 126s→51s, T9: 587s→341s.
+WL unchanged — correctness verified. Zero overlap maintained.
+
 **Plots:** `ashvin/plots/run24_multistart/`, `ashvin/plots/legalize_compare/`
 
 **What didn't work (new):**
