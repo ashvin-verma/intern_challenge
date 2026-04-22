@@ -14,6 +14,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 import torch.optim as optim
 
+from ashvin.connectivity import (
+    build_connectivity_context,
+    compute_edge_wl as connectivity_compute_edge_wl,
+    compute_neighbor_centroids,
+)
 from placement import wirelength_attraction_loss
 
 
@@ -204,26 +209,19 @@ def barycentric_refinement(
     positions = cell_features[:, 2:4].detach()
     widths = cell_features[:, 4].detach()
     heights = cell_features[:, 5].detach()
+    wl_ctx = build_connectivity_context(pin_features, edge_list, num_cells=N)
 
-    # Build cell adjacency
-    pin_to_cell = pin_features[:, 0].long()
-    cell_neighbors = [set() for _ in range(N)]
-    for e in range(edge_list.shape[0]):
-        sc = pin_to_cell[edge_list[e, 0].item()].item()
-        tc = pin_to_cell[edge_list[e, 1].item()].item()
-        if sc != tc:
-            cell_neighbors[sc].add(tc)
-            cell_neighbors[tc].add(sc)
-    cell_neighbors = [list(s) for s in cell_neighbors]
-
-    # Momentum velocity per cell
-    velocity_x = [0.0] * N
-    velocity_y = [0.0] * N
+    velocity = torch.zeros((N, 2), dtype=positions.dtype, device=positions.device)
 
     total_moves = 0
     actual_passes = 0
 
     for p in range(num_passes):
+        target_x, target_y, degree = compute_neighbor_centroids(positions, wl_ctx, N)
+        movable = torch.nonzero(degree[num_macros:] > 0, as_tuple=False).flatten() + num_macros
+        if movable.numel() == 0:
+            break
+
         # Build spatial hash for fast overlap checking
         bin_size = max(widths.max().item(), 3.0)
         x_min = positions[:, 0].min().item() - bin_size
@@ -231,33 +229,27 @@ def barycentric_refinement(
 
         bin_to_cells = defaultdict(list)
         cell_to_bin = {}
-        for i in range(N):
-            bx = int((positions[i, 0].item() - x_min) / bin_size)
-            by = int((positions[i, 1].item() - y_min) / bin_size)
+        bx_all = torch.floor((positions[:, 0] - x_min) / bin_size).long().tolist()
+        by_all = torch.floor((positions[:, 1] - y_min) / bin_size).long().tolist()
+        for i, (bx, by) in enumerate(zip(bx_all, by_all)):
             bin_to_cells[(bx, by)].append(i)
             cell_to_bin[i] = (bx, by)
 
         moves = 0
-        for i in range(num_macros, N):
-            nbrs = cell_neighbors[i]
-            if not nbrs:
-                continue
-
-            # Barycentric target
-            cx = sum(positions[n, 0].item() for n in nbrs) / len(nbrs)
-            cy = sum(positions[n, 1].item() for n in nbrs) / len(nbrs)
-
+        for i in movable.tolist():
+            cx = target_x[i].item()
+            cy = target_y[i].item()
             old_x = positions[i, 0].item()
             old_y = positions[i, 1].item()
 
             # Apply momentum: velocity = momentum * old_velocity + step * gradient
             grad_x = cx - old_x
             grad_y = cy - old_y
-            velocity_x[i] = momentum * velocity_x[i] + step * grad_x
-            velocity_y[i] = momentum * velocity_y[i] + step * grad_y
+            velocity[i, 0] = momentum * velocity[i, 0] + step * grad_x
+            velocity[i, 1] = momentum * velocity[i, 1] + step * grad_y
 
-            new_x = old_x + velocity_x[i]
-            new_y = old_y + velocity_y[i]
+            new_x = old_x + velocity[i, 0].item()
+            new_y = old_y + velocity[i, 1].item()
 
             # Spatial hash overlap check (O(neighbors) not O(N))
             positions[i, 0] = new_x
@@ -282,8 +274,8 @@ def barycentric_refinement(
             if has_overlap:
                 positions[i, 0] = old_x
                 positions[i, 1] = old_y
-                velocity_x[i] = 0.0  # reset momentum on collision
-                velocity_y[i] = 0.0
+                velocity[i, 0] = 0.0  # reset momentum on collision
+                velocity[i, 1] = 0.0
             else:
                 moves += 1
 
@@ -310,59 +302,44 @@ def targeted_scatter_reconverge(cell_features, pin_features, edge_list, config=N
     N = cell_features.shape[0]
     num_macros = (cell_features[:, 5] > 1.5).sum().item()
     pos = cell_features[:, 2:4].detach()
-    pin_to_cell = pin_features[:, 0].long()
+    wl_ctx = build_connectivity_context(pin_features, edge_list, num_cells=N)
 
     # Current WL
     m_before = calculate_normalized_metrics(cell_features, pin_features, edge_list)
     if m_before["overlap_ratio"] > 0:
         return None
 
-    # Build adjacency
-    cell_neighbors = [set() for _ in range(N)]
-    for e in range(edge_list.shape[0]):
-        sc = pin_to_cell[edge_list[e, 0].item()].item()
-        tc = pin_to_cell[edge_list[e, 1].item()].item()
-        if sc != tc:
-            cell_neighbors[sc].add(tc)
-            cell_neighbors[tc].add(sc)
+    edge_wl = connectivity_compute_edge_wl(pos, wl_ctx)
+    top_k = max(1, edge_wl.shape[0] // 5)
+    hot_idx = torch.topk(edge_wl, k=top_k).indices
+    hot_cells = torch.unique(
+        torch.cat([wl_ctx["src_cell"][hot_idx], wl_ctx["tgt_cell"][hot_idx]])
+    )
+    hot_cells = hot_cells[hot_cells >= num_macros]
 
-    # Per-edge WL
-    edge_wl = []
-    for e in range(edge_list.shape[0]):
-        sp, tp = edge_list[e, 0].item(), edge_list[e, 1].item()
-        sc, tc = pin_to_cell[sp].item(), pin_to_cell[tp].item()
-        dx = abs(pos[sc, 0].item() + pin_features[sp, 1].item()
-                 - pos[tc, 0].item() - pin_features[tp, 1].item())
-        dy = abs(pos[sc, 1].item() + pin_features[sp, 2].item()
-                 - pos[tc, 1].item() - pin_features[tp, 2].item())
-        edge_wl.append((dx + dy, sc, tc))
-
-    edge_wl.sort(reverse=True)
-    hot_cells = set()
-    for wl_val, sc, tc in edge_wl[:len(edge_wl) // 5]:
-        if sc >= num_macros:
-            hot_cells.add(sc)
-        if tc >= num_macros:
-            hot_cells.add(tc)
-
-    if not hot_cells:
+    if hot_cells.numel() == 0:
         return None
 
-    # Scatter hot cells toward neighbor centroids
+    target_x, target_y, degree = compute_neighbor_centroids(pos, wl_ctx, N)
+    hot_cells = hot_cells[degree[hot_cells] > 0]
+    if hot_cells.numel() == 0:
+        return None
+
+    scatter_alpha = config.get("scatter_neighbor_alpha", 0.5) if config else 0.5
     cf2 = cell_features.clone()
-    for i in hot_cells:
-        nbrs = list(cell_neighbors[i])
-        if nbrs:
-            cx = sum(pos[n, 0].item() for n in nbrs) / len(nbrs)
-            cy = sum(pos[n, 1].item() for n in nbrs) / len(nbrs)
-            cf2[i, 2] = pos[i, 0] + 0.5 * (cx - pos[i, 0].item())
-            cf2[i, 3] = pos[i, 1] + 0.5 * (cy - pos[i, 1].item())
+    cf2[hot_cells, 2] = pos[hot_cells, 0] + scatter_alpha * (target_x[hot_cells] - pos[hot_cells, 0])
+    cf2[hot_cells, 3] = pos[hot_cells, 1] + scatter_alpha * (target_y[hot_cells] - pos[hot_cells, 1])
 
     # Short re-solve
     scatter_config = dict(config) if config else {}
-    scatter_config["epochs"] = 200
+    scatter_epochs = scatter_config.get("scatter_epochs", 120 if N <= 40 else 80)
+    scatter_config["epochs"] = min(scatter_config.get("epochs", scatter_epochs), scatter_epochs)
+    scatter_config.setdefault("pipeline_passes", 1)
+    scatter_config.setdefault("anchor_gd_steps", 20)
+    scatter_config.setdefault("swap_iterations", 4)
     scatter_config["_skip_scatter"] = True  # prevent recursion
     scatter_config["_skip_detailed"] = True  # skip slow detailed placement in sub-solve
+    scatter_config["_skip_swaps"] = True  # outer solve still gets a full swap-engine pass
     _pair_cache["pairs"] = None
     _pair_cache["call_count"] = 0
 

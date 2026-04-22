@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 
+from ashvin.device_utils import move_runtime_tensors
 from ashvin.instrumented_train import instrumented_train_placement, two_stage_train_placement
 from ashvin.solver import solve as annealed_solve, solve_multistart, solve_scatter
 from placement import calculate_normalized_metrics, generate_placement_input
@@ -61,6 +62,7 @@ CSV_COLUMNS = [
 def run_single_test(test_id, num_macros, num_std_cells, seed, max_cells_for_eval=200000, lambda_density=0.0, two_stage=False, config=None, solver_type=None):
     """Run one test case with instrumented training."""
     torch.manual_seed(seed)
+    runtime_config = dict(config) if config else {}
 
     cell_features, pin_features, edge_list = generate_placement_input(
         num_macros, num_std_cells
@@ -75,28 +77,31 @@ def run_single_test(test_id, num_macros, num_std_cells, seed, max_cells_for_eval
     radii = torch.rand(total_cells) * spread_radius
     cell_features[:, 2] = radii * torch.cos(angles)
     cell_features[:, 3] = radii * torch.sin(angles)
+    cell_features, pin_features, edge_list, _runtime_device, _runtime_reason = move_runtime_tensors(
+        cell_features, pin_features, edge_list, config=runtime_config, verbose=True
+    )
 
     # Instrumented training
     start_time = time.perf_counter()
     if solver_type == "scatter":
         result = solve_scatter(
             cell_features, pin_features, edge_list,
-            config=config, verbose=True,
+            config=runtime_config, verbose=True,
         )
     elif solver_type == "multistart":
         result = solve_multistart(
             cell_features, pin_features, edge_list,
-            config=config, verbose=True,
+            config=runtime_config, verbose=True,
         )
     elif solver_type == "annealed":
         result = annealed_solve(
             cell_features, pin_features, edge_list,
-            config=config,
+            config=runtime_config,
         )
     elif two_stage or config is not None:
         result = two_stage_train_placement(
             cell_features, pin_features, edge_list,
-            config=config,
+            config=runtime_config,
         )
     else:
         result = instrumented_train_placement(

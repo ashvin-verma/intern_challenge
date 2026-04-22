@@ -263,7 +263,7 @@ def wirelength_attraction_loss(cell_features, pin_features, edge_list):
         Scalar loss value
     """
     if edge_list.shape[0] == 0:
-        return torch.tensor(0.0, requires_grad=True)
+        return torch.tensor(0.0, requires_grad=True, device=cell_features.device)
 
     # Update absolute pin positions based on cell positions
     cell_positions = cell_features[:, 2:4]  # [N, 2]
@@ -345,7 +345,7 @@ def overlap_repulsion_loss(cell_features, pin_features, edge_list):
     """
     N = cell_features.shape[0]
     if N <= 1:
-        return torch.tensor(0.0, requires_grad=True)
+        return torch.tensor(0.0, requires_grad=True, device=cell_features.device)
 
     # Use scalable spatial-hash approach for large designs
     if N >= 500:
@@ -407,6 +407,26 @@ def train_placement(
             - initial_cell_features: Original cell positions (for comparison)
             - loss_history: Loss values over time
     """
+    # Submission path: delegate the public challenge entrypoint to the strongest
+    # config-gated solver used for the leaderboard run.
+    import json
+    from pathlib import Path
+
+    from ashvin.solver import solve_multistart
+
+    config_path = Path(__file__).resolve().parent / "ashvin" / "results" / "ranking_push_config.json"
+    solver_config = {}
+    if config_path.exists():
+        with config_path.open() as f:
+            solver_config = json.load(f)
+    return solve_multistart(
+        cell_features,
+        pin_features,
+        edge_list,
+        config=solver_config,
+        verbose=verbose,
+    )
+
     # Clone features and create learnable positions
     cell_features = cell_features.clone()
     initial_cell_features = cell_features.clone()
@@ -446,7 +466,7 @@ def train_placement(
             from ashvin.density import density_loss as _density_loss
             d_loss = _density_loss(cell_features_current)
         else:
-            d_loss = torch.tensor(0.0)
+            d_loss = torch.tensor(0.0, device=cell_features_current.device)
 
         # Combined loss
         total_loss = lambda_wirelength * wl_loss + lambda_overlap * overlap_loss + lambda_density * d_loss
@@ -517,10 +537,10 @@ def calculate_overlap_metrics(cell_features):
         }
 
     # Extract cell properties
-    positions = cell_features[:, 2:4].detach().numpy()  # [N, 2]
-    widths = cell_features[:, 4].detach().numpy()  # [N]
-    heights = cell_features[:, 5].detach().numpy()  # [N]
-    areas = cell_features[:, 0].detach().numpy()  # [N]
+    positions = cell_features[:, 2:4].detach().cpu().numpy()  # [N, 2]
+    widths = cell_features[:, 4].detach().cpu().numpy()  # [N]
+    heights = cell_features[:, 5].detach().cpu().numpy()  # [N]
+    areas = cell_features[:, 0].detach().cpu().numpy()  # [N]
 
     overlap_count = 0
     total_overlap_area = 0.0
@@ -583,9 +603,9 @@ def calculate_cells_with_overlaps(cell_features):
         return scalable_cells_with_overlaps(cell_features)
 
     # Extract cell properties
-    positions = cell_features[:, 2:4].detach().numpy()
-    widths = cell_features[:, 4].detach().numpy()
-    heights = cell_features[:, 5].detach().numpy()
+    positions = cell_features[:, 2:4].detach().cpu().numpy()
+    widths = cell_features[:, 4].detach().cpu().numpy()
+    heights = cell_features[:, 5].detach().cpu().numpy()
 
     cells_with_overlaps = set()
 
@@ -692,9 +712,9 @@ def plot_placement(
             (ax2, final_cell_features, "Final Placement"),
         ]:
             N = cell_features.shape[0]
-            positions = cell_features[:, 2:4].detach().numpy()
-            widths = cell_features[:, 4].detach().numpy()
-            heights = cell_features[:, 5].detach().numpy()
+            positions = cell_features[:, 2:4].detach().cpu().numpy()
+            widths = cell_features[:, 4].detach().cpu().numpy()
+            heights = cell_features[:, 5].detach().cpu().numpy()
 
             # Draw cells
             for i in range(N):

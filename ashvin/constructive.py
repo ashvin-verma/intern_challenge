@@ -149,7 +149,7 @@ def build_island_features(cell_features, pin_features, edge_list, islands, islan
             cell_to_island[c] = isl_idx
 
     # Island features: [area, num_pins, x, y, width, height]
-    island_cf = torch.zeros(N_islands, 6)
+    island_cf = torch.zeros(N_islands, 6, device=cell_features.device, dtype=cell_features.dtype)
     for isl_idx, cells in enumerate(islands):
         isl_w, isl_h, _ = island_packing[isl_idx]
         # Centroid from member cells' current positions
@@ -226,7 +226,11 @@ def coarse_place(island_cf, island_pf, edge_list,
 
         wl_loss = wirelength_attraction_loss(cf_cur, island_pf, edge_list)
         ov_loss = scalable_overlap_loss(cf_cur, beta=beta)
-        d_loss = density_loss(cf_cur) if lambda_density > 0 else torch.tensor(0.0)
+        d_loss = (
+            density_loss(cf_cur)
+            if lambda_density > 0
+            else torch.tensor(0.0, device=cf_cur.device)
+        )
 
         total = lambda_wl * wl_loss + lam_ov * ov_loss + lambda_density * d_loss
         total.backward()

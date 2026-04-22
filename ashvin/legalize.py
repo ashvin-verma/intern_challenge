@@ -124,35 +124,41 @@ def legalize(cell_features, num_macros=None, pin_features=None, edge_list=None):
 
     # --- Step 2: Legalize std cells (row-based packing) ---
     if num_macros < N:
-        std_indices = list(range(num_macros, N))
+        std_indices = torch.arange(num_macros, N, dtype=torch.long, device=positions.device)
 
         # WL-aware sort: group cells by nearest macro region, then by x within region
         if pin_features is not None and edge_list is not None and num_macros > 0:
-            from collections import Counter
             pin_to_cell = pin_features[:, 0].long()
-            # Find each std cell's most-connected macro
-            cell_macro_affinity = {}
-            for e in range(edge_list.shape[0]):
-                sc = pin_to_cell[edge_list[e, 0].item()].item()
-                tc = pin_to_cell[edge_list[e, 1].item()].item()
-                if sc < num_macros and tc >= num_macros:
-                    cell_macro_affinity.setdefault(tc, Counter())[sc] += 1
-                elif tc < num_macros and sc >= num_macros:
-                    cell_macro_affinity.setdefault(sc, Counter())[tc] += 1
+            src_cell = pin_to_cell[edge_list[:, 0].long()]
+            tgt_cell = pin_to_cell[edge_list[:, 1].long()]
+            macro_std = (src_cell < num_macros) & (tgt_cell >= num_macros)
+            std_macro = (tgt_cell < num_macros) & (src_cell >= num_macros)
 
-            # Sort by: (macro_region_x, cell_x) so cells near same macro pack together
-            def sort_key(idx):
-                if idx in cell_macro_affinity:
-                    best_macro = cell_macro_affinity[idx].most_common(1)[0][0]
-                    return (positions[best_macro, 0].item(), positions[idx, 0].item())
-                return (positions[idx, 0].item(), positions[idx, 0].item())
+            std_local = torch.cat([
+                tgt_cell[macro_std] - num_macros,
+                src_cell[std_macro] - num_macros,
+            ])
+            macro_idx = torch.cat([src_cell[macro_std], tgt_cell[std_macro]])
 
-            sorted_std = sorted(std_indices, key=sort_key)
+            std_x = positions[std_indices, 0]
+            if std_local.numel() > 0:
+                flat = std_local * num_macros + macro_idx
+                counts = torch.bincount(flat, minlength=(N - num_macros) * num_macros).view(N - num_macros, num_macros)
+                has_affinity = counts.sum(dim=1) > 0
+                best_macro = counts.argmax(dim=1)
+                primary_x = std_x.clone()
+                primary_x[has_affinity] = positions[best_macro[has_affinity], 0]
+                sort_order = torch.argsort(std_x, stable=True)
+                sort_order = sort_order[torch.argsort(primary_x[sort_order], stable=True)]
+                sorted_std = std_indices[sort_order].tolist()
+            else:
+                sort_order = torch.argsort(std_x)
+                sorted_std = std_indices[sort_order].tolist()
         else:
             # Fallback: sort by x position
             std_x = positions[std_indices, 0]
             sort_order = torch.argsort(std_x)
-            sorted_std = [std_indices[i] for i in sort_order.tolist()]
+            sorted_std = std_indices[sort_order].tolist()
 
         # Collect all macro bounding boxes as obstacles
         obstacles = []
@@ -165,23 +171,23 @@ def legalize(cell_features, num_macros=None, pin_features=None, edge_list=None):
 
         # Row-based packing: std cells have height=1.0
         # Group into rows by quantizing y to nearest integer
-        row_height = 1.0
+        std_row_height = heights[num_macros:].max().item() if num_macros < N else 1.0
+        row_height = max(1.0, std_row_height) + 1e-3
 
         # Determine row range from current positions
         all_y = positions[std_indices, 1]
         y_min = all_y.min().item() - 10
-        y_max = all_y.max().item() + 10
 
         # Assign each std cell to nearest row
         row_assignments = {}
-        for idx in sorted_std:
-            y = positions[idx, 1].item()
-            row_idx = round((y - y_min) / row_height)
+        row_ids = torch.round((positions[sorted_std, 1] - y_min) / row_height).long().tolist()
+        for idx, row_idx in zip(sorted_std, row_ids):
             if row_idx not in row_assignments:
                 row_assignments[row_idx] = []
             row_assignments[row_idx].append(idx)
 
         # For each row, pack cells left-to-right avoiding overlaps
+        packing_eps = 1e-3
         for row_idx, cells_in_row in row_assignments.items():
             row_y = y_min + row_idx * row_height
 
@@ -198,7 +204,7 @@ def legalize(cell_features, num_macros=None, pin_features=None, edge_list=None):
 
                 # Start from target_x or cursor_x, whichever is further right
                 if cursor_x is not None:
-                    x = max(target_x, cursor_x + w / 2)
+                    x = max(target_x, cursor_x + w / 2 + packing_eps)
                 else:
                     x = target_x
 

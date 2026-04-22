@@ -1,289 +1,280 @@
-"""Fast iterative cell-swap engine — the core WL optimizer.
-
-After legalization, this engine runs hundreds of targeted moves to recover
-WL destroyed by legalization. Each move is O(degree) to evaluate.
+"""
+Fast row-structured local search after legalization.
 
 Two move types:
-A. Within-row swap: exchange two cells' ordering in the same row, recompact.
-   Always legal. O(degree_i + degree_j) to evaluate.
-B. Cross-row reinsertion: remove cell from its row, insert into another row
-   near its barycentric target. Compact both rows. Always legal.
-   O(degree_i + cells_in_target_row) to evaluate.
-
-Key design: operate on ROW STRUCTURE not positions. Rows are ordered lists
-of cell indices. Compaction converts a row ordering into x-positions.
+1. Within-row swap: exchange two cells in the same row and recompact.
+2. Cross-row reinsertion: remove a cell from one row and insert it into
+   another row near a connectivity-driven target.
 """
 
 import sys
 import time
-from collections import defaultdict
+from bisect import bisect_left
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 
-
-# ── Data structures ──────────────────────────────────────────────────
-
-def build_adjacency(pin_features, edge_list):
-    """Build cell→edges and edge→cells mappings."""
-    pin_to_cell = pin_features[:, 0].long().tolist()
-    cell_edges = defaultdict(list)
-    E = edge_list.shape[0]
-    for e in range(E):
-        sc = pin_to_cell[edge_list[e, 0].item()]
-        tc = pin_to_cell[edge_list[e, 1].item()]
-        cell_edges[sc].append(e)
-        if tc != sc:
-            cell_edges[tc].append(e)
-    return pin_to_cell, cell_edges
+from ashvin.connectivity import (
+    build_connectivity_context,
+    collect_incident_edges,
+    compute_cell_wl_scores,
+    compute_neighbor_centroids,
+    edge_wl_sum,
+    get_cell_neighbors,
+)
 
 
-def build_rows(positions, heights, num_macros, N):
-    """Build row structure: row_y → [cell indices sorted by x]."""
+def build_rows(positions, num_macros, num_cells):
+    """Build row structure: row_y -> [cell indices sorted by x]."""
     rows = {}
     cell_row = {}
-    for i in range(num_macros, N):
-        ry = round(positions[i, 1].item() * 10) / 10
-        if ry not in rows:
-            rows[ry] = []
-        rows[ry].append(i)
-        cell_row[i] = ry
-    for ry in rows:
-        rows[ry].sort(key=lambda c: positions[c, 0].item())
-    return rows, cell_row
+    row_index = {}
+
+    for cell_idx in range(num_macros, num_cells):
+        row_y = round(positions[cell_idx, 1].item() * 10.0) / 10.0
+        rows.setdefault(row_y, []).append(cell_idx)
+        cell_row[cell_idx] = row_y
+
+    for row_y, row_cells in rows.items():
+        row_cells.sort(key=lambda c: positions[c, 0].item())
+        row_index[row_y] = {cell_idx: idx for idx, cell_idx in enumerate(row_cells)}
+
+    return rows, cell_row, row_index
 
 
 def compact_row(row_cells, widths, start_x):
-    """Given ordered cells, compute x-positions by left-to-right packing.
-    Returns list of (cell_idx, new_x) pairs."""
-    result = []
+    """Pack a row from left to right and return (cell_idx, new_x) pairs."""
+    packed = []
     cursor = start_x
-    for ci in row_cells:
-        w = widths[ci].item()
-        x = cursor + w / 2
-        result.append((ci, x))
-        cursor = x + w / 2
-    return result
+    for cell_idx in row_cells:
+        width = widths[cell_idx].item()
+        new_x = cursor + width / 2.0
+        packed.append((cell_idx, new_x))
+        cursor = new_x + width / 2.0
+    return packed
 
 
 def get_row_start(row_cells, positions, widths):
-    """Get the leftmost edge of a row's current extent."""
+    """Get the left edge of a row's current extent."""
     if not row_cells:
         return 0.0
     first = row_cells[0]
-    return positions[first, 0].item() - widths[first].item() / 2
+    return positions[first, 0].item() - widths[first].item() / 2.0
 
-
-# ── WL evaluation ───────────────────────────────────────────────────
-
-def cell_wl(ci, positions, pin_features, edge_list, pin_to_cell, cell_edges):
-    """Total Manhattan WL of edges incident to cell ci."""
-    total = 0.0
-    for e in cell_edges.get(ci, []):
-        sp = edge_list[e, 0].item()
-        tp = edge_list[e, 1].item()
-        sc, tc = pin_to_cell[sp], pin_to_cell[tp]
-        dx = abs(positions[sc, 0].item() + pin_features[sp, 1].item()
-                 - positions[tc, 0].item() - pin_features[tp, 1].item())
-        dy = abs(positions[sc, 1].item() + pin_features[sp, 2].item()
-                 - positions[tc, 1].item() - pin_features[tp, 2].item())
-        total += dx + dy
-    return total
-
-
-def barycentric_target(ci, positions, pin_features, edge_list, pin_to_cell, cell_edges):
-    """Compute barycentric center of cell's connected neighbors."""
-    sx, sy, cnt = 0.0, 0.0, 0
-    for e in cell_edges.get(ci, []):
-        sp = edge_list[e, 0].item()
-        tp = edge_list[e, 1].item()
-        sc, tc = pin_to_cell[sp], pin_to_cell[tp]
-        other = tc if sc == ci else sc
-        sx += positions[other, 0].item()
-        sy += positions[other, 1].item()
-        cnt += 1
-    if cnt == 0:
-        return positions[ci, 0].item(), positions[ci, 1].item()
-    return sx / cnt, sy / cnt
-
-
-# ── Macro obstacle checking ────────────────────────────────────────
 
 def build_macro_obstacles(positions, widths, heights, num_macros):
-    obs = []
-    for i in range(num_macros):
-        x, y = positions[i, 0].item(), positions[i, 1].item()
-        w, h = widths[i].item(), heights[i].item()
-        obs.append((x - w/2, y - h/2, x + w/2, y + h/2))
-    return obs
+    obstacles = []
+    for macro_idx in range(num_macros):
+        x = positions[macro_idx, 0].item()
+        y = positions[macro_idx, 1].item()
+        w = widths[macro_idx].item()
+        h = heights[macro_idx].item()
+        obstacles.append((x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0))
+    return obstacles
 
 
 def check_macro_overlap(x, y, w, h, obstacles):
-    l, r, b, t = x - w/2, x + w/2, y - h/2, y + h/2
-    for ol, ob, or_, ot in obstacles:
-        if r > ol and l < or_ and t > ob and b < ot:
+    left = x - w / 2.0
+    right = x + w / 2.0
+    bottom = y - h / 2.0
+    top = y + h / 2.0
+    for obs_left, obs_bottom, obs_right, obs_top in obstacles:
+        if right > obs_left and left < obs_right and top > obs_bottom and bottom < obs_top:
             return True
     return False
 
 
-# ── Move operations ─────────────────────────────────────────────────
-
-def try_within_row_swap(ci, cj, row_cells, positions, widths, heights,
-                        pin_features, edge_list, pin_to_cell, cell_edges,
-                        obstacles, row_y):
-    """Try swapping ci and cj within their row. Returns WL delta (negative = better)."""
-    idx_i = row_cells.index(ci)
-    idx_j = row_cells.index(cj)
-
-    # Swap in ordering
+def try_within_row_swap(
+    ci,
+    cj,
+    row_cells,
+    idx_i,
+    idx_j,
+    positions,
+    widths,
+    heights,
+    wl_ctx,
+    obstacles,
+    row_y,
+):
+    """Try swapping ci and cj in the same row. Returns (delta, plan)."""
     new_order = list(row_cells)
     new_order[idx_i], new_order[idx_j] = new_order[idx_j], new_order[idx_i]
-
-    # Recompact
     start_x = get_row_start(row_cells, positions, widths)
-    new_pos = compact_row(new_order, widths, start_x)
+    packed = compact_row(new_order, widths, start_x)
 
-    # Check macro overlaps
-    for c, nx in new_pos:
-        if check_macro_overlap(nx, row_y, widths[c].item(), heights[c].item(), obstacles):
-            return 0.0, None  # blocked
+    for cell_idx, new_x in packed:
+        if check_macro_overlap(new_x, row_y, widths[cell_idx].item(), heights[cell_idx].item(), obstacles):
+            return 0.0, None
 
-    # WL before for ALL cells in row (not just swapped pair)
-    # Only edges incident to cells in this row are affected
-    affected = set()
-    lo, hi = min(idx_i, idx_j), max(idx_i, idx_j)
-    for k in range(lo, hi + 1):
-        affected.add(row_cells[k])
+    lo = min(idx_i, idx_j)
+    hi = max(idx_i, idx_j)
+    affected = row_cells[lo:hi + 1]
+    incident_edges = collect_incident_edges(affected, wl_ctx)
+    wl_before = edge_wl_sum(incident_edges, positions, wl_ctx)
 
-    wl_before = 0.0
-    seen_edges = set()
-    for c in affected:
-        for e in cell_edges.get(c, []):
-            if e not in seen_edges:
-                seen_edges.add(e)
-                sp, tp = edge_list[e, 0].item(), edge_list[e, 1].item()
-                sc, tc = pin_to_cell[sp], pin_to_cell[tp]
-                dx = abs(positions[sc, 0].item() + pin_features[sp, 1].item()
-                         - positions[tc, 0].item() - pin_features[tp, 1].item())
-                dy = abs(positions[sc, 1].item() + pin_features[sp, 2].item()
-                         - positions[tc, 1].item() - pin_features[tp, 2].item())
-                wl_before += dx + dy
+    old_x = {}
+    for cell_idx, new_x in packed:
+        old_x[cell_idx] = positions[cell_idx, 0].item()
+        positions[cell_idx, 0] = new_x
 
-    # Apply temporarily
-    old_xs = {}
-    for c, nx in new_pos:
-        old_xs[c] = positions[c, 0].item()
-        positions[c, 0] = nx
+    wl_after = edge_wl_sum(incident_edges, positions, wl_ctx)
 
-    wl_after = 0.0
-    for e in seen_edges:
-        sp, tp = edge_list[e, 0].item(), edge_list[e, 1].item()
-        sc, tc = pin_to_cell[sp], pin_to_cell[tp]
-        dx = abs(positions[sc, 0].item() + pin_features[sp, 1].item()
-                 - positions[tc, 0].item() - pin_features[tp, 1].item())
-        dy = abs(positions[sc, 1].item() + pin_features[sp, 2].item()
-                 - positions[tc, 1].item() - pin_features[tp, 2].item())
-        wl_after += dx + dy
+    for cell_idx, _ in packed:
+        positions[cell_idx, 0] = old_x[cell_idx]
 
-    # Revert
-    for c, _ in new_pos:
-        positions[c, 0] = old_xs[c]
-
-    delta = wl_after - wl_before  # negative = improvement
-    return delta, new_order
+    return wl_after - wl_before, {
+        "new_order": new_order,
+        "packed_positions": packed,
+        "swap_pair": (ci, cj),
+    }
 
 
-def try_cross_row_move(ci, src_row_cells, dst_row_cells, dst_row_y,
-                       insert_x, positions, widths, heights,
-                       pin_features, edge_list, pin_to_cell, cell_edges,
-                       obstacles):
-    """Try moving ci from src_row to dst_row at insert_x. Returns WL delta."""
-    # WL before (cell i + cells that will be displaced)
-    wl_before_i = cell_wl(ci, positions, pin_features, edge_list, pin_to_cell, cell_edges)
-
-    # Save old state
-    old_x = positions[ci, 0].item()
-    old_y = positions[ci, 1].item()
-
-    # New source row (without ci)
-    new_src = [c for c in src_row_cells if c != ci]
-
-    # New dest row (with ci inserted at correct position)
+def try_cross_row_move(
+    ci,
+    src_row_cells,
+    dst_row_cells,
+    dst_row_y,
+    insert_x,
+    positions,
+    widths,
+    heights,
+    wl_ctx,
+    obstacles,
+):
+    """Try moving ci to dst_row. Returns (delta, plan)."""
+    new_src = [cell_idx for cell_idx in src_row_cells if cell_idx != ci]
+    dst_x = [positions[cell_idx, 0].item() for cell_idx in dst_row_cells]
+    insert_idx = bisect_left(dst_x, insert_x)
     new_dst = list(dst_row_cells)
-    new_dst.append(ci)
-    # Temporarily set ci's position for sorting
-    positions[ci, 0] = insert_x
-    positions[ci, 1] = dst_row_y
-    new_dst.sort(key=lambda c: positions[c, 0].item())
+    new_dst.insert(insert_idx, ci)
 
-    # Compact dest row
-    if new_dst:
-        # Anchor compaction near the GD centroid of the row
-        centroid_x = sum(positions[c, 0].item() for c in new_dst) / len(new_dst)
-        total_w = sum(widths[c].item() for c in new_dst)
-        start_x = centroid_x - total_w / 2
-        dst_packed = compact_row(new_dst, widths, start_x)
-    else:
-        dst_packed = []
+    src_start = get_row_start(src_row_cells, positions, widths) if new_src else None
+    dst_start = (
+        get_row_start(dst_row_cells, positions, widths)
+        if dst_row_cells
+        else insert_x - widths[ci].item() / 2.0
+    )
 
-    # Check macro overlaps for dest
-    for c, nx in dst_packed:
-        if check_macro_overlap(nx, dst_row_y, widths[c].item(), heights[c].item(), obstacles):
-            positions[ci, 0] = old_x
-            positions[ci, 1] = old_y
-            return 0.0, None, None
+    src_packed = compact_row(new_src, widths, src_start) if new_src else []
+    dst_packed = compact_row(new_dst, widths, dst_start) if new_dst else []
 
-    # Apply dest positions temporarily
+    for cell_idx, new_x in src_packed:
+        cur_y = positions[cell_idx, 1].item()
+        if check_macro_overlap(new_x, cur_y, widths[cell_idx].item(), heights[cell_idx].item(), obstacles):
+            return 0.0, None
+    for cell_idx, new_x in dst_packed:
+        if check_macro_overlap(new_x, dst_row_y, widths[cell_idx].item(), heights[cell_idx].item(), obstacles):
+            return 0.0, None
+
+    affected = new_src + new_dst
+    incident_edges = collect_incident_edges(affected, wl_ctx)
+    wl_before = edge_wl_sum(incident_edges, positions, wl_ctx)
+
     old_positions = {}
-    for c, nx in dst_packed:
-        old_positions[c] = (positions[c, 0].item(), positions[c, 1].item())
-        positions[c, 0] = nx
-        positions[c, 1] = dst_row_y
+    for cell_idx in set(affected):
+        old_positions[cell_idx] = (
+            positions[cell_idx, 0].item(),
+            positions[cell_idx, 1].item(),
+        )
 
-    # Compact source row
-    if new_src:
-        src_start = get_row_start(src_row_cells, positions, widths)
-        # But ci was removed, so start from first remaining
-        src_centroid = sum(positions[c, 0].item() for c in new_src) / len(new_src)
-        src_total_w = sum(widths[c].item() for c in new_src)
-        src_start = src_centroid - src_total_w / 2
-        src_packed = compact_row(new_src, widths, src_start)
-        for c, nx in src_packed:
-            if c not in old_positions:
-                old_positions[c] = (positions[c, 0].item(), positions[c, 1].item())
-            positions[c, 0] = nx
-    else:
-        src_packed = []
+    for cell_idx, new_x in src_packed:
+        positions[cell_idx, 0] = new_x
+    for cell_idx, new_x in dst_packed:
+        positions[cell_idx, 0] = new_x
+        positions[cell_idx, 1] = dst_row_y
 
-    # WL after
-    wl_after_i = cell_wl(ci, positions, pin_features, edge_list, pin_to_cell, cell_edges)
+    wl_after = edge_wl_sum(incident_edges, positions, wl_ctx)
 
-    delta = wl_after_i - wl_before_i
+    for cell_idx, (old_x, old_y) in old_positions.items():
+        positions[cell_idx, 0] = old_x
+        positions[cell_idx, 1] = old_y
 
-    # Revert all
-    for c, (ox, oy) in old_positions.items():
-        positions[c, 0] = ox
-        positions[c, 1] = oy
-    positions[ci, 0] = old_x
-    positions[ci, 1] = old_y
-
-    return delta, new_src, new_dst
+    return wl_after - wl_before, {
+        "new_src": new_src,
+        "new_dst": new_dst,
+        "src_packed": src_packed,
+        "dst_packed": dst_packed,
+    }
 
 
-# ── Main engine ─────────────────────────────────────────────────────
+def _build_row_lookup(rows, row_keys, num_cells, device):
+    cell_row_ids = torch.full((num_cells,), -1, dtype=torch.long, device=device)
+    for row_id, row_y in enumerate(row_keys):
+        row_cells = rows[row_y]
+        if row_cells:
+            row_tensor = torch.as_tensor(row_cells, dtype=torch.long, device=device)
+            cell_row_ids[row_tensor] = row_id
+    return cell_row_ids
 
-def swap_engine(cell_features, pin_features, edge_list,
-                max_iterations=20, num_macros=None, verbose=False):
-    """Fast iterative cell-swap engine.
 
-    Runs many rounds of within-row swaps and cross-row reinsertions
-    until convergence. Modifies cell_features[:, 2:4] in-place.
-    """
+def _rank_destination_rows(
+    ci,
+    cur_row_y,
+    target_x,
+    target_y,
+    row_keys,
+    cell_row_ids,
+    positions,
+    wl_ctx,
+    cross_row_limit,
+):
+    ranked = []
+    seen_rows = set()
+    neighbors = get_cell_neighbors(ci, wl_ctx)
+
+    if neighbors.numel() > 0 and row_keys:
+        neighbor_row_ids = cell_row_ids[neighbors]
+        valid_mask = neighbor_row_ids >= 0
+        valid_neighbors = neighbors[valid_mask]
+        valid_row_ids = neighbor_row_ids[valid_mask]
+
+        if valid_row_ids.numel() > 0:
+            unique_row_ids, counts = torch.unique(valid_row_ids, return_counts=True)
+            preferred = []
+            for row_id, count in zip(unique_row_ids.tolist(), counts.tolist()):
+                row_y = row_keys[row_id]
+                if abs(row_y - cur_row_y) < 0.05:
+                    continue
+                row_neighbors = valid_neighbors[valid_row_ids == row_id]
+                row_target_x = positions[row_neighbors, 0].mean().item()
+                preferred.append((-count, abs(row_y - target_y), row_y, row_target_x))
+
+            preferred.sort()
+            for _neg_count, _dist, row_y, row_target_x in preferred:
+                ranked.append((row_y, row_target_x))
+                seen_rows.add(row_y)
+                if len(ranked) >= cross_row_limit:
+                    return ranked
+
+    fallback_rows = sorted(row_keys, key=lambda row_y: abs(row_y - target_y))
+    for row_y in fallback_rows:
+        if abs(row_y - cur_row_y) < 0.05 or row_y in seen_rows:
+            continue
+        ranked.append((row_y, target_x))
+        if len(ranked) >= cross_row_limit:
+            break
+
+    return ranked
+
+
+def swap_engine(
+    cell_features,
+    pin_features,
+    edge_list,
+    max_iterations=20,
+    num_macros=None,
+    enable_within_row_swaps=False,
+    within_row_window=3,
+    cross_row_limit=None,
+    verbose=False,
+):
+    """Fast iterative cell swap engine."""
     start_time = time.perf_counter()
-    N = cell_features.shape[0]
-    if N <= 1:
+    num_cells = cell_features.shape[0]
+    if num_cells <= 1:
         return {"time": 0.0, "swaps": 0, "moves": 0, "iterations": 0}
 
     if num_macros is None:
@@ -292,30 +283,33 @@ def swap_engine(cell_features, pin_features, edge_list,
     positions = cell_features[:, 2:4].detach()
     widths = cell_features[:, 4].detach()
     heights = cell_features[:, 5].detach()
-
-    pin_to_cell, cell_edges = build_adjacency(pin_features, edge_list)
+    wl_ctx = build_connectivity_context(pin_features, edge_list, num_cells=num_cells)
     obstacles = build_macro_obstacles(positions, widths, heights, num_macros)
 
     total_swaps = 0
     total_moves = 0
+    if cross_row_limit is None:
+        cross_row_limit = 6 if num_cells <= 300 else 4
 
+    executed_iterations = 0
     for iteration in range(max_iterations):
-        rows, cell_row = build_rows(positions, heights, num_macros, N)
+        rows, cell_row, row_index = build_rows(positions, num_macros, num_cells)
         row_keys = sorted(rows.keys())
+        if not row_keys:
+            break
+        executed_iterations = iteration + 1
+        row_id_by_y = {row_y: row_id for row_id, row_y in enumerate(row_keys)}
 
+        cell_scores = compute_cell_wl_scores(positions, wl_ctx, num_cells)
+        target_x, target_y, _degree = compute_neighbor_centroids(positions, wl_ctx, num_cells)
+        cell_row_ids = _build_row_lookup(rows, row_keys, num_cells, positions.device)
+
+        ordered_cells = torch.argsort(cell_scores[num_macros:], descending=True) + num_macros
         iter_swaps = 0
         iter_moves = 0
-
-        # Score all std cells by WL contribution
-        cell_scores = []
-        for i in range(num_macros, N):
-            wl = cell_wl(i, positions, pin_features, edge_list, pin_to_cell, cell_edges)
-            cell_scores.append((wl, i))
-        cell_scores.sort(reverse=True)
-
         moved_cells = set()
 
-        for _score, ci in cell_scores:
+        for ci in ordered_cells.tolist():
             if ci in moved_cells:
                 continue
 
@@ -324,59 +318,111 @@ def swap_engine(cell_features, pin_features, edge_list,
                 continue
 
             cur_row = rows.get(cur_row_y, [])
-            if ci not in cur_row:
+            idx_ci = row_index[cur_row_y].get(ci)
+            if idx_ci is None:
                 continue
 
-            # Compute barycentric target
-            tx, ty = barycentric_target(ci, positions, pin_features, edge_list,
-                                        pin_to_cell, cell_edges)
+            neighbors = get_cell_neighbors(ci, wl_ctx)
+            neighbor_set = set(neighbors.tolist()) if neighbors.numel() > 0 else set()
 
-            # ── Cross-row reinsertion ──
-            # Try rows near barycentric target
-            best_delta = -0.01  # low threshold — accept any improvement
+            best_swap_delta = -0.01
+            best_swap_plan = None
+            if enable_within_row_swaps and len(cur_row) > 1:
+                lo = max(0, idx_ci - within_row_window)
+                hi = min(len(cur_row), idx_ci + within_row_window + 1)
+                candidate_indices = list(range(idx_ci - 1, lo - 1, -1))
+                candidate_indices.extend(range(idx_ci + 1, hi))
+                candidate_indices.sort(
+                    key=lambda idx_j: (
+                        0 if cur_row[idx_j] in neighbor_set else 1,
+                        abs(idx_j - idx_ci),
+                    )
+                )
+
+                for idx_j in candidate_indices:
+                    cj = cur_row[idx_j]
+                    if cj in moved_cells:
+                        continue
+
+                    delta, swap_plan = try_within_row_swap(
+                        ci,
+                        cj,
+                        cur_row,
+                        idx_ci,
+                        idx_j,
+                        positions,
+                        widths,
+                        heights,
+                        wl_ctx,
+                        obstacles,
+                        cur_row_y,
+                    )
+
+                    if delta < best_swap_delta:
+                        best_swap_delta = delta
+                        best_swap_plan = swap_plan
+
+            if best_swap_plan is not None:
+                for cell_idx, new_x in best_swap_plan["packed_positions"]:
+                    positions[cell_idx, 0] = new_x
+                rows[cur_row_y] = best_swap_plan["new_order"]
+                row_index[cur_row_y] = {
+                    cell_idx: idx for idx, cell_idx in enumerate(best_swap_plan["new_order"])
+                }
+                moved_cells.add(ci)
+                iter_swaps += 1
+                continue
+
+            candidate_rows = _rank_destination_rows(
+                ci,
+                cur_row_y,
+                target_x[ci].item(),
+                target_y[ci].item(),
+                row_keys,
+                cell_row_ids,
+                positions,
+                wl_ctx,
+                cross_row_limit,
+            )
+
+            best_delta = -0.01
             best_move = None
-
-            # Sort candidate rows by distance to target y
-            sorted_dst_rows = sorted(row_keys, key=lambda ry: abs(ry - ty))
-
-            for dst_ry in sorted_dst_rows[:8]:  # try up to 8 nearest rows
-                if abs(dst_ry - cur_row_y) < 0.05:
-                    continue  # skip same row
-
-                dst_row = rows.get(dst_ry, [])
-
-                delta, new_src, new_dst = try_cross_row_move(
-                    ci, cur_row, dst_row, dst_ry, tx,
-                    positions, widths, heights,
-                    pin_features, edge_list, pin_to_cell, cell_edges,
-                    obstacles)
-
+            for dst_row_y, insert_x in candidate_rows:
+                dst_row = rows.get(dst_row_y, [])
+                delta, move_plan = try_cross_row_move(
+                    ci,
+                    cur_row,
+                    dst_row,
+                    dst_row_y,
+                    insert_x,
+                    positions,
+                    widths,
+                    heights,
+                    wl_ctx,
+                    obstacles,
+                )
                 if delta < best_delta:
                     best_delta = delta
-                    best_move = (dst_ry, new_src, new_dst)
+                    best_move = (dst_row_y, move_plan)
 
             if best_move is not None:
-                dst_ry, new_src, new_dst = best_move
+                dst_row_y, move_plan = best_move
+                for cell_idx, new_x in move_plan["src_packed"]:
+                    positions[cell_idx, 0] = new_x
+                for cell_idx, new_x in move_plan["dst_packed"]:
+                    positions[cell_idx, 0] = new_x
+                    positions[cell_idx, 1] = dst_row_y
 
-                # Apply: compact source row using its original start
-                if new_src:
-                    src_start = get_row_start(cur_row, positions, widths)
-                    for c, nx in compact_row(new_src, widths, src_start):
-                        positions[c, 0] = nx
-
-                # Apply: position ci and compact dest row
-                positions[ci, 0] = tx
-                positions[ci, 1] = dst_ry
-                new_dst.sort(key=lambda c: positions[c, 0].item())
-                if new_dst:
-                    dst_start = get_row_start(dst_row, positions, widths) if dst_row else tx - widths[ci].item() / 2
-                    for c, nx in compact_row(new_dst, widths, dst_start):
-                        positions[c, 0] = nx
-                        positions[c, 1] = dst_ry
-
-                rows[cur_row_y] = new_src
-                rows[dst_ry] = new_dst
-                cell_row[ci] = dst_ry
+                rows[cur_row_y] = move_plan["new_src"]
+                rows[dst_row_y] = move_plan["new_dst"]
+                row_index[cur_row_y] = {
+                    cell_idx: idx for idx, cell_idx in enumerate(move_plan["new_src"])
+                }
+                row_index[dst_row_y] = {
+                    cell_idx: idx for idx, cell_idx in enumerate(move_plan["new_dst"])
+                }
+                cell_row[ci] = dst_row_y
+                cell_row_ids[ci] = row_id_by_y[dst_row_y]
                 moved_cells.add(ci)
                 iter_moves += 1
 
@@ -393,12 +439,14 @@ def swap_engine(cell_features, pin_features, edge_list,
 
     elapsed = time.perf_counter() - start_time
     if verbose:
-        print(f"    Swap engine done: {total_swaps} swaps, {total_moves} moves, "
-              f"{iteration+1} iters, {elapsed:.1f}s")
+        print(
+            f"    Swap engine done: {total_swaps} swaps, {total_moves} moves, "
+            f"{executed_iterations} iters, {elapsed:.1f}s"
+        )
 
     return {
         "time": elapsed,
         "swaps": total_swaps,
         "moves": total_moves,
-        "iterations": iteration + 1,
+        "iterations": executed_iterations,
     }

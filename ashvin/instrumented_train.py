@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 import torch.optim as optim
 
+from ashvin.device_utils import move_runtime_tensors
 from placement import overlap_repulsion_loss, wirelength_attraction_loss
 
 
@@ -30,6 +31,11 @@ def instrumented_train_placement(
     Returns dict with all keys from train_placement() plus:
         timing: dict with cumulative seconds for each phase
     """
+    runtime_config = {}
+    cell_features, pin_features, edge_list, _runtime_device, _runtime_reason = move_runtime_tensors(
+        cell_features, pin_features, edge_list, config=runtime_config, verbose=verbose
+    )
+
     cell_features = cell_features.clone()
     initial_cell_features = cell_features.clone()
 
@@ -79,7 +85,7 @@ def instrumented_train_placement(
         if density_loss_fn is not None:
             d_loss = density_loss_fn(cell_features_current)
         else:
-            d_loss = torch.tensor(0.0)
+            d_loss = torch.tensor(0.0, device=cell_features_current.device)
         t3 = time.perf_counter()
 
         total_loss = (
@@ -220,7 +226,11 @@ def _run_stage(
                 cell_features_current, pin_features, edge_list
             )
         t2 = time.perf_counter()
-        d_loss = density_loss_fn(cell_features_current) if lambda_density > 0 else torch.tensor(0.0)
+        d_loss = (
+            density_loss_fn(cell_features_current)
+            if lambda_density > 0
+            else torch.tensor(0.0, device=cell_features_current.device)
+        )
         t3 = time.perf_counter()
 
         total_loss = lambda_wl * wl_loss + cur_lambda_overlap * overlap_loss + lambda_density * d_loss
@@ -280,6 +290,11 @@ def two_stage_train_placement(
     If config dict is provided, it overrides all keyword arguments.
     Returns same dict format as instrumented_train_placement().
     """
+    config = dict(config) if config else {}
+    cell_features, pin_features, edge_list, _runtime_device, _runtime_reason = move_runtime_tensors(
+        cell_features, pin_features, edge_list, config=config, verbose=verbose
+    )
+
     # Config dict overrides keyword arguments
     if config is not None:
         stage_a_epochs = config.get("stage_a_epochs", stage_a_epochs)

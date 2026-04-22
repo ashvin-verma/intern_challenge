@@ -6,6 +6,7 @@ Tier 2: StdCell-StdCell pairs (spatial hash) — O(N) average
 
 from collections import defaultdict
 
+import numpy as np
 import torch
 
 
@@ -135,54 +136,101 @@ def _generate_stdcell_pairs(positions, widths, heights, num_macros, bin_size):
         # Convert to global indices
         pairs = pairs_local + num_macros
         return pairs
-    else:
-        # Large N: x-sorted sweepline with vectorized y-check
-        # Sort by x, then for each cell check forward neighbors within max_w
+    elif num_std <= 20000:
+        # Large N: x-sorted sweepline with NumPy searchsorted to avoid the Python
+        # per-cell while-loop and repeated tensor.item() calls.
         max_w = std_w.max().item()
-        max_h_val = std_h.max().item()
 
         sort_idx = torch.argsort(std_pos[:, 0])
-        sorted_x = std_pos[sort_idx, 0]
-        sorted_y = std_pos[sort_idx, 1]
-        sorted_w = std_w[sort_idx]
-        sorted_h = std_h[sort_idx]
-        sorted_global = sort_idx + num_macros
+        sorted_x = std_pos[sort_idx, 0].cpu().numpy()
+        sorted_y = std_pos[sort_idx, 1].cpu().numpy()
+        sorted_w = std_w[sort_idx].cpu().numpy()
+        sorted_h = std_h[sort_idx].cpu().numpy()
+        sorted_global = (sort_idx + num_macros).cpu().numpy()
+
+        # Tighter x-window than the old global-max-width bound:
+        # x_j - x_i must be smaller than (w_i + max_w) / 2 to overlap.
+        window_end = np.searchsorted(sorted_x, sorted_x + 0.5 * (sorted_w + max_w), side="left")
 
         pair_chunks = []
-        # Sweep: for each cell i, check cells j > i while x_j - x_i < max_w
         for i in range(num_std - 1):
-            xi = sorted_x[i].item()
-            # Find range of j where x_j < xi + max_w
             j_start = i + 1
-            # Binary search for end
-            j_end = j_start
-            while j_end < num_std and sorted_x[j_end].item() - xi < max_w:
-                j_end += 1
-
+            j_end = int(window_end[i])
             if j_end <= j_start:
                 continue
 
-            # Vectorized check for [j_start:j_end]
-            js = slice(j_start, j_end)
-            dx = sorted_x[js] - xi
-            dy = torch.abs(sorted_y[js] - sorted_y[i])
-            sep_x = (sorted_w[i] + sorted_w[js]) / 2
-            sep_y = (sorted_h[i] + sorted_h[js]) / 2
+            dx = sorted_x[j_start:j_end] - sorted_x[i]
+            dy = np.abs(sorted_y[j_start:j_end] - sorted_y[i])
+            sep_x = 0.5 * (sorted_w[i] + sorted_w[j_start:j_end])
+            sep_y = 0.5 * (sorted_h[i] + sorted_h[j_start:j_end])
             mask = (dx < sep_x) & (dy < sep_y)
+            if not np.any(mask):
+                continue
 
-            if mask.any():
-                j_indices = torch.arange(j_start, j_end, device=dev)[mask]
-                gi = sorted_global[i].expand(len(j_indices))
-                gj = sorted_global[j_indices]
-                lo = torch.min(gi, gj)
-                hi = torch.max(gi, gj)
-                pair_chunks.append(torch.stack([lo, hi], dim=1))
+            gj = sorted_global[j_start:j_end][mask]
+            gi = np.full(gj.shape, sorted_global[i], dtype=np.int64)
+            pair_chunks.append(np.stack([np.minimum(gi, gj), np.maximum(gi, gj)], axis=1))
 
         if not pair_chunks:
             return torch.zeros((0, 2), dtype=torch.long, device=dev)
 
-        pairs = torch.cat(pair_chunks, dim=0)
-        return torch.unique(pairs, dim=0)
+        pairs = np.concatenate(pair_chunks, axis=0)
+        return torch.from_numpy(pairs).to(device=dev, dtype=torch.long)
+    else:
+        # Very large N: use an actual spatial hash so candidate generation stays
+        # near-linear instead of scanning a forward x-window for every cell.
+        x = std_pos[:, 0].cpu().numpy()
+        y = std_pos[:, 1].cpu().numpy()
+        w = std_w.cpu().numpy()
+        h = std_h.cpu().numpy()
+        global_idx = (torch.arange(num_std, device=dev, dtype=torch.long) + num_macros).cpu().numpy()
+
+        cell_bin = max(float(bin_size), float(std_w.max().item()), float(std_h.max().item()))
+        x_min = float(x.min()) - cell_bin
+        y_min = float(y.min()) - cell_bin
+        bx = np.floor((x - x_min) / cell_bin).astype(np.int64)
+        by = np.floor((y - y_min) / cell_bin).astype(np.int64)
+
+        bin_to_cells = defaultdict(list)
+        for idx, key in enumerate(zip(bx.tolist(), by.tolist())):
+            bin_to_cells[key].append(idx)
+
+        pair_chunks = []
+        neighbor_offsets = [(0, 0), (1, 0), (0, 1), (1, 1), (-1, 1)]
+
+        def append_pairs(src_idx, dst_idx, same_bin=False):
+            if len(src_idx) == 0 or len(dst_idx) == 0:
+                return
+
+            src_arr = np.asarray(src_idx, dtype=np.int64)
+            dst_arr = np.asarray(dst_idx, dtype=np.int64)
+            dx = np.abs(x[src_arr][:, None] - x[dst_arr][None, :])
+            dy = np.abs(y[src_arr][:, None] - y[dst_arr][None, :])
+            sep_x = 0.5 * (w[src_arr][:, None] + w[dst_arr][None, :])
+            sep_y = 0.5 * (h[src_arr][:, None] + h[dst_arr][None, :])
+            mask = (dx < sep_x) & (dy < sep_y)
+            if same_bin:
+                mask = np.triu(mask, k=1)
+            if not np.any(mask):
+                return
+
+            pair_idx = np.argwhere(mask)
+            gi = global_idx[src_arr[pair_idx[:, 0]]]
+            gj = global_idx[dst_arr[pair_idx[:, 1]]]
+            pair_chunks.append(np.stack([np.minimum(gi, gj), np.maximum(gi, gj)], axis=1))
+
+        for (cell_bx, cell_by), src_cells in bin_to_cells.items():
+            for off_x, off_y in neighbor_offsets:
+                dst_cells = bin_to_cells.get((cell_bx + off_x, cell_by + off_y))
+                if dst_cells is None:
+                    continue
+                append_pairs(src_cells, dst_cells, same_bin=(off_x == 0 and off_y == 0))
+
+        if not pair_chunks:
+            return torch.zeros((0, 2), dtype=torch.long, device=dev)
+
+        pairs = np.concatenate(pair_chunks, axis=0)
+        return torch.from_numpy(pairs).to(device=dev, dtype=torch.long)
 
 
 def generate_candidate_pairs(positions, widths, heights, num_macros, bin_size=3.0):

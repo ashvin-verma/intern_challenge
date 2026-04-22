@@ -29,7 +29,7 @@ def spectral_placement(cell_features, pin_features, edge_list):
     pin_to_cell = pin_features[:, 0].long()
 
     # Build adjacency matrix (cell-level, weighted by edge count)
-    adj = torch.zeros(N, N)
+    adj = torch.zeros(N, N, device=cell_features.device, dtype=cell_features.dtype)
     for e in range(edge_list.shape[0]):
         src_cell = pin_to_cell[edge_list[e, 0].item()].item()
         tgt_cell = pin_to_cell[edge_list[e, 1].item()].item()
